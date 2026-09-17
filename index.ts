@@ -17,6 +17,7 @@ import { atomicJson, privateDirectory, safeError, ApiError, readBoundedResponse,
 import { ServiceAccountTokens } from "./src/auth.js";
 import { DurableInbox, lockInbox } from "./src/inbox.js";
 import { maintainSubscription, MESSAGE_EVENT } from "./src/subscriptions.js";
+import { ActivityProgress, type ProgressConfig } from "./src/progress.js";
 import {
   resolveInboundRouteEnvelopeBuilderWithRuntime,
 } from "openclaw/plugin-sdk/inbound-envelope";
@@ -75,6 +76,7 @@ interface PubSubConfig {
   bindings: SpaceBinding[];
   crossAgentDispatch?: boolean;
   silentReply?: boolean;
+  progress?: ProgressConfig;
 }
 
 interface RoutingEntry {
@@ -455,11 +457,15 @@ function validateConfig(): void {
   if (config.auth && !["service-account", "user-oauth"].includes(config.auth.mode)) throw new Error("Invalid authentication mode");
   if (authMode() === "user-oauth" && (!config.oauth?.clientId || !config.oauth.clientSecret || !config.oauth.tokensFile)) throw new Error("User OAuth configuration is incomplete");
   if (authMode() === "service-account" && (config.reactionsEnabled || config.media?.outboundEnabled)) throw new Error("App authentication does not support user-only reactions/uploads");
+  for (const value of [config.progress?.enabled, config.progress?.includeDetails]) {
+    if (value !== undefined && typeof value !== "boolean") throw new Error("Invalid progress setting");
+  }
   for (const [value, min, max] of [
     [config.pollIntervalSeconds ?? 3, 1, 300], [config.agentTimeoutSeconds ?? 60, 10, 3600],
     [config.maxPendingMessages ?? 200, 1, 1000], [config.renewalBufferMinutes ?? 30, 1, 60],
     [mediaLimit(), 1, 200 * 1024 * 1024], [config.media?.maxAttachments ?? 5, 1, 10],
     [config.media?.retentionHours ?? 24, 1, 168],
+    [config.progress?.updateIntervalSeconds ?? 5, 2, 30], [config.progress?.maxRecentActivities ?? 3, 1, 8],
   ]) { if (!Number.isInteger(value) || value < min || value > max) throw new Error("Invalid numeric limit in plugin configuration"); }
 }
 
@@ -1055,15 +1061,15 @@ async function processMessageInPipeline(params: {
     }
   }
 
-  // 5) Typing indicator (skipped when silentReply is true)
-  //    silentReply=true (default): no typing message posted — reply sent directly as a new POST
-  //    silentReply=false: legacy behaviour — post "_typing..._" then PATCH with the reply
+  // 5) Optional single status message. Activity mode takes precedence over the
+  // legacy static typing setting and uses the same message for the final reply.
+  const progressEnabled = config.progress?.enabled === true;
   const silentReply = config.silentReply !== false; // default true
   let typingMessageName: string | undefined;
-  if (!silentReply) {
+  if ((progressEnabled || !silentReply) && !activeAbort?.signal.aborted) {
     try {
       const botToken = await getBotToken();
-      const typingBody: any = { text: "_typing..._" };
+      const typingBody: any = { text: progressEnabled ? "_OpenClaw is working…_" : "_typing..._" };
       if (replyThreadName) typingBody.thread = { name: replyThreadName };
       const typingUrl = replyThreadName
         ? `https://chat.googleapis.com/v1/${space}/messages?messageReplyOption=${replyMessageOption}`
@@ -1077,7 +1083,9 @@ async function processMessageInPipeline(params: {
       });
       logger.info(`⏳ Typing indicator result: status=${result.status} name=${result.data?.name || 'none'}`);
       if (result.status < 400 && result.data?.name) {
+        assertChatMessage(result.data, space);
         typingMessageName = result.data.name;
+        markProcessed(typingMessageName);
         // Capture the actual thread name from the response (important for new threads)
         if (replyInThread && result.data?.thread?.name && !replyThreadName) {
           replyThreadName = result.data.thread.name;
@@ -1092,6 +1100,23 @@ async function processMessageInPipeline(params: {
     logger.info(`🔇 silentReply=true — skipping typing indicator`);
   }
 
+  const progress = progressEnabled && typingMessageName ? new ActivityProgress({
+    intervalMs: (config.progress?.updateIntervalSeconds ?? 5) * 1000,
+    maxRecent: config.progress?.maxRecentActivities ?? 3,
+    includeDetails: config.progress?.includeDetails !== false,
+    signal: activeAbort?.signal,
+    update: async text => {
+      const token = await getBotToken();
+      if (activeAbort?.signal.aborted) throw new Error("Progress cancelled");
+      const result = await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`, {
+        method: "PATCH", headers: { Authorization: `Bearer ${token}` }, body: { text },
+      });
+      if (result.status >= 400) throw new ApiError("Chat progress", result.status);
+      assertChatMessage(result.data, space);
+    },
+    onError: error => logger.warn(`Activity updates stopped: ${safeError(error)}`),
+  }) : undefined;
+
   // 6) Dispatch reply through the OpenClaw agent pipeline
   const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
     cfg,
@@ -1101,103 +1126,134 @@ async function processMessageInPipeline(params: {
   });
 
   let pipelineError: Error | undefined;
-  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg,
-    dispatcherOptions: {
-      ...prefixOptions,
-      deliver: async (payload: {
-        text?: string;
-        mediaUrls?: string[];
-        mediaUrl?: string;
-        replyToId?: string;
-      }, info?: any) => {
-        logger.debug(`Reply delivery: kind=${info?.kind || "unknown"}`);
-        if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
-        assertDestination(space, threadName || undefined);
-        const botToken = await getBotToken();
-        const replyText = payload.text?.trim();
+  try {
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        ...prefixOptions,
+        deliver: async (payload: {
+          text?: string;
+          mediaUrls?: string[];
+          mediaUrl?: string;
+          replyToId?: string;
+        }, info?: any) => {
+          logger.debug(`Reply delivery: kind=${info?.kind || "unknown"}`);
+          if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+          assertDestination(space, threadName || undefined);
+          const botToken = await getBotToken();
+          const replyText = payload.text?.trim();
 
-        // Collect media refs from either payload shape.
-        const mediaRefs = [
-          ...(payload.mediaUrls || []),
-          ...(payload.mediaUrl ? [payload.mediaUrl] : []),
-        ].filter((m): m is string => Boolean(m && String(m).trim()));
-        const uniqueMediaRefs = [...new Set(mediaRefs)];
+          // Collect media refs from either payload shape.
+          const mediaRefs = [
+            ...(payload.mediaUrls || []),
+            ...(payload.mediaUrl ? [payload.mediaUrl] : []),
+          ].filter((m): m is string => Boolean(m && String(m).trim()));
+          const uniqueMediaRefs = [...new Set(mediaRefs)];
 
-        if (uniqueMediaRefs.length > 0) {
-          requireOutboundMedia();
-          // Media path: attachments carry the text as the first message's caption.
-          const effectiveThread = replyThreadName || undefined;
+          if (uniqueMediaRefs.length > 0) {
+            await progress?.stop();
+            if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+            requireOutboundMedia();
+            // Media path: attachments carry the text as the first message's caption.
+            const effectiveThread = replyThreadName || undefined;
 
-          // Retire the typing placeholder first so the attachment is not orphaned behind it.
-          if (typingMessageName) {
-            await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${botToken}` },
-            }).catch(() => {});
-            typingMessageName = undefined;
-          }
-
-          if (replyText) deliveredChunks.push(replyText);
-
-          const result = await sendMediaMessages({
-            space,
-            mediaRefs: uniqueMediaRefs,
-            token: await getOAuthToken(),
-            text: replyText,
-            threadName: effectiveThread,
-            replyMessageOption,
-          });
-          if (result.failed.length) throw new Error("One or more media deliveries failed");
-          logger.info(
-            `📎 Media delivery: ${result.sent}/${uniqueMediaRefs.length} sent` +
-              (result.failed.length ? ` | failures: ${result.failed.join("; ").slice(0, 300)}` : "")
-          );
-          return;
-        }
-
-        if (!replyText) return;
-
-        // Track delivered text for cross-agent dispatch
-        deliveredChunks.push(replyText);
-
-        const chunkLimit = 4000;
-        const chunks: string[] = [];
-        if (replyText.length <= chunkLimit) {
-          chunks.push(replyText);
-        } else {
-          // Simple chunking by newlines
-          let remaining = replyText;
-          while (remaining.length > 0) {
-            if (remaining.length <= chunkLimit) {
-              chunks.push(remaining);
-              break;
+            // Retire the typing placeholder first so the attachment is not orphaned behind it.
+            if (typingMessageName) {
+              await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${botToken}` },
+              }).catch(() => {});
+              typingMessageName = undefined;
             }
-            let cut = remaining.lastIndexOf("\n", chunkLimit);
-            if (cut <= 0) cut = chunkLimit;
-            chunks.push(remaining.slice(0, cut));
-            remaining = remaining.slice(cut).trimStart();
-          }
-        }
 
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          try {
-            if (i === 0 && typingMessageName) {
-              // Edit typing indicator with first chunk
-              logger.info(`📝 PATCHing typing message: ${typingMessageName}`);
-              const patchResult = await httpJson(
-                `https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`,
-                {
-                  method: "PATCH",
-                  headers: { Authorization: `Bearer ${botToken}` },
-                  body: { text: chunk },
+            if (replyText) deliveredChunks.push(replyText);
+
+            const result = await sendMediaMessages({
+              space,
+              mediaRefs: uniqueMediaRefs,
+              token: await getOAuthToken(),
+              text: replyText,
+              threadName: effectiveThread,
+              replyMessageOption,
+            });
+            if (result.failed.length) throw new Error("One or more media deliveries failed");
+            logger.info(
+              `📎 Media delivery: ${result.sent}/${uniqueMediaRefs.length} sent` +
+                (result.failed.length ? ` | failures: ${result.failed.join("; ").slice(0, 300)}` : "")
+            );
+            return;
+          }
+
+          if (!replyText) return;
+          await progress?.stop();
+          if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+
+          // Track delivered text for cross-agent dispatch
+          deliveredChunks.push(replyText);
+
+          const chunkLimit = 4000;
+          const chunks: string[] = [];
+          if (replyText.length <= chunkLimit) {
+            chunks.push(replyText);
+          } else {
+            // Simple chunking by newlines
+            let remaining = replyText;
+            while (remaining.length > 0) {
+              if (remaining.length <= chunkLimit) {
+                chunks.push(remaining);
+                break;
+              }
+              let cut = remaining.lastIndexOf("\n", chunkLimit);
+              if (cut <= 0) cut = chunkLimit;
+              chunks.push(remaining.slice(0, cut));
+              remaining = remaining.slice(cut).trimStart();
+            }
+          }
+
+          for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            try {
+              if (i === 0 && typingMessageName) {
+                // Edit typing indicator with first chunk
+                logger.info(`📝 PATCHing typing message: ${typingMessageName}`);
+                const patchResult = await httpJson(
+                  `https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`,
+                  {
+                    method: "PATCH",
+                    headers: { Authorization: `Bearer ${botToken}` },
+                    body: { text: chunk },
+                  }
+                );
+                if (patchResult.status >= 400) {
+                  logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
+                  // Fallback: send as new message
+                  const msgBody: any = { text: chunk };
+                  let url = `https://chat.googleapis.com/v1/${space}/messages`;
+                  const effectiveThread = replyThreadName || undefined;
+                  if (effectiveThread) {
+                    msgBody.thread = { name: effectiveThread };
+                    url += `?messageReplyOption=${replyMessageOption}`;
+                  }
+                  const postResult = await httpJson(url, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${botToken}` },
+                    body: msgBody,
+                  });
+                  if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
+                  assertChatMessage(postResult.data, space);
+                  logger.info(`POST fallback result: ${postResult.status}`);
+                  // A failed edit can leave the working message behind. Retire it
+                  // after fallback delivery succeeds (404 deletion is harmless).
+                  await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+                    method: "DELETE", headers: { Authorization: `Bearer ${botToken}` },
+                  }).catch(() => {});
+                } else {
+                  assertChatMessage(patchResult.data, space);
+                  logger.info(`✅ PATCH succeeded`);
                 }
-              );
-              if (patchResult.status >= 400) {
-                logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
-                // Fallback: send as new message
+                typingMessageName = undefined;
+              } else {
                 const msgBody: any = { text: chunk };
                 let url = `https://chat.googleapis.com/v1/${space}/messages`;
                 const effectiveThread = replyThreadName || undefined;
@@ -1212,84 +1268,63 @@ async function processMessageInPipeline(params: {
                 });
                 if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
                 assertChatMessage(postResult.data, space);
-                logger.info(`POST fallback result: ${postResult.status}`);
-              } else {
-                assertChatMessage(patchResult.data, space);
-                logger.info(`✅ PATCH succeeded`);
+                logger.info(`📨 POST result: ${postResult.status}`);
               }
-              typingMessageName = undefined;
-            } else {
-              const msgBody: any = { text: chunk };
-              let url = `https://chat.googleapis.com/v1/${space}/messages`;
-              const effectiveThread = replyThreadName || undefined;
-              if (effectiveThread) {
-                msgBody.thread = { name: effectiveThread };
-                url += `?messageReplyOption=${replyMessageOption}`;
-              }
-              const postResult = await httpJson(url, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${botToken}` },
-                body: msgBody,
-              });
-              if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
-              assertChatMessage(postResult.data, space);
-              logger.info(`📨 POST result: ${postResult.status}`);
+            } catch (err: any) {
+              logger.error(`Chat API reply failed: ${safeError(err)}`);
+              pipelineError = new Error("Chat API reply failed");
+              throw pipelineError;
             }
-          } catch (err: any) {
-            logger.error(`Chat API reply failed: ${safeError(err)}`);
-            pipelineError = new Error("Chat API reply failed");
-            throw pipelineError;
           }
-        }
+        },
+        onSkip: (payload: any, info: any) => {
+          logger.debug(`Reply skipped: kind=${info?.kind || "unknown"}`);
+        },
+        onHeartbeatStrip: () => {
+          logger.info(`💓 Heartbeat strip triggered`);
+        },
+        onError: (err: any, info: any) => {
+          pipelineError = new Error("Agent or reply delivery failed");
+          logger.error(
+            `googlechatpubsub reply ${info?.kind || "?"} failed: ${safeError(err)}`
+          );
+          // Cleanup is awaited in finally after any in-flight activity edit.
+        },
       },
-      onSkip: (payload: any, info: any) => {
-        logger.debug(`Reply skipped: kind=${info?.kind || "unknown"}`);
+      replyOptions: {
+        onModelSelected,
+        ...(progressEnabled ? {
+          suppressDefaultToolProgressMessages: true,
+          suppressToolProgressMessages: true,
+          allowToolLifecycleWhenProgressHidden: true,
+          commentaryProgressEnabled: false,
+          progressPreambleEnabled: false,
+          commentaryPayloadsEnabled: false,
+          reasoningPayloadsEnabled: false,
+          onToolStart: (event: Parameters<ActivityProgress["onToolStart"]>[0]) => progress?.onToolStart(event) ?? false,
+          onItemEvent: (event: Parameters<ActivityProgress["onItemEvent"]>[0]) => progress?.onItemEvent(event) ?? false,
+        } : {}),
+        abortSignal: activeAbort?.signal,
+        onAgentRunTerminalOutcome: (outcome: string) => { if (outcome === "failed") pipelineError = new Error("Agent run failed"); },
       },
-      onHeartbeatStrip: () => {
-        logger.info(`💓 Heartbeat strip triggered`);
-      },
-      onError: (err: any, info: any) => {
-        pipelineError = new Error("Agent or reply delivery failed");
-        logger.error(
-          `googlechatpubsub reply ${info?.kind || "?"} failed: ${safeError(err)}`
-        );
-        // Clean up typing indicator on error
-        if (typingMessageName) {
-          getBotToken()
-            .then((t) =>
-              httpJson(
-                `https://chat.googleapis.com/v1/${typingMessageName}`,
-                {
-                  method: "DELETE",
-                  headers: { Authorization: `Bearer ${t}` },
-                }
-              )
-            )
-            .catch(() => {});
-        }
-      },
-    },
-    replyOptions: {
-      onModelSelected,
-      abortSignal: activeAbort?.signal,
-      onAgentRunTerminalOutcome: (outcome: string) => { if (outcome === "failed") pipelineError = new Error("Agent run failed"); },
-    },
-  });
-
-  // Clean up orphaned typing indicator (e.g. agent replied NO_REPLY / silent skip)
-  // If deliver was called, typingMessageName was set to undefined inside deliver.
-  // If we get here and it's still set, no delivery happened — delete the stale message.
-  if (typingMessageName) {
-    logger.info(`🧹 Cleaning up orphaned typing message: ${typingMessageName}`);
-    try {
-      const cleanupToken = await getBotToken();
-      await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${cleanupToken}` },
-      });
-      logger.info(`✅ Orphaned typing message deleted`);
-    } catch (err: any) {
-      logger.error(`Failed to delete orphaned typing message: ${safeError(err)}`);
+    });
+  } finally {
+    await progress?.stop();
+    // Clean up orphaned typing indicator (e.g. agent replied NO_REPLY / silent skip)
+    // If deliver was called, typingMessageName was set to undefined inside deliver.
+    // If we get here and it's still set, no delivery happened — delete the stale message.
+    if (typingMessageName) {
+      logger.info(`🧹 Cleaning up orphaned typing message: ${typingMessageName}`);
+      try {
+        const cleanupToken = await getBotToken();
+        await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${cleanupToken}` },
+        });
+        logger.info(`✅ Orphaned typing message deleted`);
+      } catch (err: any) {
+        logger.error(`Failed to delete orphaned typing message: ${safeError(err)}`);
+      }
     }
   }
 

@@ -62,7 +62,7 @@
           "silentReply": {
             "type": "boolean",
             "default": true,
-            "description": "When true, suppress typing indicator messages while the agent is working."
+            "description": "Suppress the legacy static typing message. progress.enabled takes precedence."
           },
           "oauth": {
             "type": "object",
@@ -265,6 +265,35 @@
                 "default": 24
               }
             }
+          },
+          "progress": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "One editable activity message per agent run, replaced by the final reply. Takes precedence over silentReply.",
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": false
+              },
+              "updateIntervalSeconds": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 30,
+                "default": 5,
+                "description": "Minimum time between activity edits; unchanged text is not sent again."
+              },
+              "maxRecentActivities": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "default": 3
+              },
+              "includeDetails": {
+                "type": "boolean",
+                "default": true,
+                "description": "Show bounded tool-provided titles and search queries. Disable for tool names/counts only. Never forwards commands, tool output, or reasoning."
+              }
+            }
           }
         },
         "required": []
@@ -355,7 +384,7 @@
       "silentReply": {
         "type": "boolean",
         "default": true,
-        "description": "When true, suppress typing indicator messages while the agent is working."
+        "description": "Suppress the legacy static typing message. progress.enabled takes precedence."
       },
       "oauth": {
         "type": "object",
@@ -556,6 +585,35 @@
             "minimum": 1,
             "maximum": 168,
             "default": 24
+          }
+        }
+      },
+      "progress": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One editable activity message per agent run, replaced by the final reply. Takes precedence over silentReply.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "updateIntervalSeconds": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 30,
+            "default": 5,
+            "description": "Minimum time between activity edits; unchanged text is not sent again."
+          },
+          "maxRecentActivities": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 3
+          },
+          "includeDetails": {
+            "type": "boolean",
+            "default": true,
+            "description": "Show bounded tool-provided titles and search queries. Disable for tool names/counts only. Never forwards commands, tool output, or reasoning."
           }
         }
       }

@@ -106,13 +106,14 @@ async function fetchWithSsrFGuard(p) {
 config = {auth:{mode:'user-oauth'},allowFrom:['users/123'],
   bindings:['spaces/TESTSPACE123','spaces/S'].map(space=>({space,agents:[{agentId:'main',alwaysListen:true}]})),
   media:{inboundEnabled:true,outboundEnabled:true,allowRemoteUrls:true,localRoots:${JSON.stringify([tmpdir(), PLUGIN_DIR])},maxBytes:200*1024*1024,maxAttachments:10}};
-export {DurableInbox,lockInbox,atomicJson,readBoundedResponse,readMediaFile,fetchMedia,ServiceAccountTokens,AUTH_SCOPES,maintainSubscription,MESSAGE_EVENT,safeError};
+export {ActivityProgress,DurableInbox,lockInbox,atomicJson,readBoundedResponse,readMediaFile,fetchMedia,ServiceAccountTokens,AUTH_SCOPES,maintainSubscription,MESSAGE_EVENT,safeError};
 export {crossAgentDispatch,isSenderAllowed,isCommandAuthorized,assertDestination,admittedJobs,validateConfig,pollOnce,startInboxWorker,processMessageInPipeline,getOAuthToken,getPubSubToken};
 export function __configure(p) {
   if(p.config){config=p.config; routingTable=buildRoutingTable(config.bindings||[]);}
   if(p.api) pluginApi=p.api;
   if(p.inbox) inbox=p.inbox;
   if(p.tokens) authTokens=p.tokens;
+  if('abort' in p) activeAbort=p.abort;
   if(p.logger) logger=p.logger;
   if('stopping' in p) stopping=p.stopping;
   fatalInboxError=false; lastRenewalCheck=Date.now();

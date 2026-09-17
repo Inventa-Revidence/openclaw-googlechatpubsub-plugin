@@ -7,7 +7,7 @@ const SPACE = 'spaces/TESTSPACE123';
 const INCOMING_THREAD = `${SPACE}/threads/incoming`;
 const OWN_THREAD = `${SPACE}/threads/bot-placeholder`;
 
-function fixture(t, { threaded = false, isolated = threaded, typing = false, media = false, failPatch = false, failAttachment = false } = {}) {
+function fixture(t, { threaded = false, isolated = threaded, typing = false, progress = false, media = false, failPatch = false, failAttachment = false } = {}) {
   const tmp = makeTempDir('reply-mode');
   const file = tmp.file('attachment.txt', 'synthetic attachment');
   const tokensFile = tmp.file('tokens.json', JSON.stringify({refresh_token:'SYNTHETIC_REFRESH'}));
@@ -15,6 +15,7 @@ function fixture(t, { threaded = false, isolated = threaded, typing = false, med
     auth: {mode: media ? 'user-oauth' : 'service-account'},
     ...(media && {oauth:{clientId:'synthetic',clientSecret:'synthetic',tokensFile}}),
     allowFrom:['users/123'], silentReply:!typing,
+    progress:{enabled:progress},
     media:{outboundEnabled:media,localRoots:[tmp.dir]},
     bindings:[{space:SPACE,replyInThread:threaded,threadSessionIsolation:isolated,agents:[{agentId:'main',alwaysListen:true}]}],
   };
@@ -106,6 +107,15 @@ test('pipeline attachments post in the space after retiring a typing placeholder
   const f=fixture(t,{typing:true,media:true});await f.run([{text:'Caption',mediaUrl:f.file}]);
   assertSpacePosts(f);assert.ok(f.requests.some(r=>r.method==='DELETE'));
   const attachment=messagePosts(f).find(r=>r.body.attachment);assert.ok(attachment);assert.equal(attachment.body.text,'Caption');
+});
+
+test('activity placeholder is retired before a space-level attachment reply',async t=>{
+  const f=fixture(t,{progress:true,media:true});await f.run([{text:'Caption',mediaUrl:f.file}]);
+  assertSpacePosts(f);assert.match(messagePosts(f)[0].body.text,/OpenClaw is working/);
+  const deletion=f.requests.findIndex(r=>r.method==='DELETE');
+  const attachment=f.requests.findIndex(r=>r.body?.attachment);
+  assert.ok(deletion>0 && attachment>deletion);
+  assert.equal(f.requests.filter(r=>r.method==='PATCH').length,0);
 });
 
 test('attachment failure keeps the caption fallback in the space',async t=>{

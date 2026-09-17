@@ -317,6 +317,120 @@ async function maintainSubscription(params) {
   return { name: sub.name, expiresAt, space };
 }
 
+// src/progress.ts
+function displayText(value) {
+  if (typeof value !== "string") return;
+  const text = value.replace(/-----BEGIN [\s\S]*?(?:-----END [^\n]+-----|$)/g, "[redacted]").replace(/\b(?:Bearer|Basic)\s+\S+/gi, "[redacted]").replace(/\b(?:password|passwd|secret|(?:access_|refresh_|api_)?token|api[_-]?key|authorization)\b["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi, "[redacted]").replace(/\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{20,}|github_pat_[\w]{20,}|AIza[\w-]{20,}|ya29\.[\w.-]+)/g, "[redacted]").replace(/https?:\/\/\S+/gi, "[link]").replace(/<[^>]*>/g, "").replace(/[<>*_~`\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ").replace(/\s+/g, " ").trim();
+  return text ? Array.from(text).slice(0, 160).join("") : void 0;
+}
+function toolLabel(name = "") {
+  const short = name.split(/[.:/]/).pop().toLowerCase();
+  if (["exec", "exec_command", "shell", "bash", "run_command"].includes(short)) return "Commands";
+  const known = {
+    memory_search: "Memory Search",
+    memory_get: "Read Memory",
+    read: "Read File",
+    read_file: "Read File",
+    write: "Write File",
+    edit: "Edit File",
+    apply_patch: "Edit File",
+    web_search: "Web Search",
+    web_fetch: "Fetch Page",
+    tool_search: "Search Tools"
+  };
+  if (known[short]) return known[short];
+  return /^[a-z][a-z0-9_-]{0,39}$/.test(short) ? short.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()) : "Other Tools";
+}
+var ActivityProgress = class {
+  constructor(options) {
+    this.options = options;
+    if (options.signal?.aborted) this.stopped = true;
+    else options.signal?.addEventListener("abort", this.abort, { once: true });
+  }
+  options;
+  activities = /* @__PURE__ */ new Map();
+  counts = /* @__PURE__ */ new Map();
+  recent = [];
+  sequence = 0;
+  timer;
+  inFlight;
+  stopped = false;
+  visible = false;
+  lastText = "";
+  lastEdit = Date.now();
+  abort = () => {
+    void this.stop();
+  };
+  onToolStart(event) {
+    return this.record(event, false);
+  }
+  onItemEvent(event) {
+    if (event.kind !== "tool" && event.kind !== "command") return false;
+    return this.record(event, true);
+  }
+  record(event, item) {
+    if (this.stopped) return false;
+    const id = event.toolCallId || event.itemId?.replace(/^(?:tool|command):/, "");
+    if (!id && (item || event.phase && event.phase !== "start")) return false;
+    const key = id || `anonymous:${++this.sequence}`;
+    let activity = this.activities.get(key);
+    if (!activity) {
+      if (this.activities.size >= 1e4) return false;
+      let label = toolLabel(event.name || (event.kind === "command" ? "exec" : ""));
+      if (!this.counts.has(label) && this.counts.size >= 8) label = "Other Tools";
+      activity = { label, status: "running" };
+      this.activities.set(key, activity);
+      this.counts.set(label, (this.counts.get(label) || 0) + 1);
+      this.recent.push(activity);
+      if (this.recent.length > this.options.maxRecent) this.recent.shift();
+    }
+    if (!item && this.options.includeDetails) {
+      const detail = displayText(event.args?.title) || (["Memory Search", "Web Search", "Search Tools"].includes(activity.label) ? displayText(event.args?.query) : void 0);
+      if (detail) activity.detail = detail;
+    }
+    if (["failed", "error", "blocked", "cancelled", "canceled"].includes(event.status || "")) activity.status = "failed";
+    else if (["completed", "complete", "done"].includes(event.status || "")) activity.status = "completed";
+    this.schedule();
+    return this.visible;
+  }
+  render() {
+    const counts = [...this.counts].map(([label, count]) => `${label} \xD7${count}`).join(" \xB7 ");
+    const lines = this.recent.map((a) => `${a.status === "completed" ? "\u2713" : a.status === "failed" ? "!" : "\u2026"} ${a.label}${a.detail ? ` \u2014 ${a.detail}` : ""}`);
+    return ["_OpenClaw is working\u2026_", counts, ...lines].filter(Boolean).join("\n");
+  }
+  schedule() {
+    if (this.stopped || this.timer || this.inFlight || this.lastText === this.render()) return;
+    this.timer = setTimeout(() => {
+      this.timer = void 0;
+      if (this.stopped) return;
+      const text = this.render();
+      if (text === this.lastText) return;
+      this.inFlight = (async () => {
+        try {
+          await this.options.update(text);
+          this.lastText = text;
+          this.visible = true;
+        } catch (error) {
+          this.stopped = true;
+          this.options.onError(error);
+        } finally {
+          this.lastEdit = Date.now();
+          this.inFlight = void 0;
+          this.schedule();
+        }
+      })();
+    }, Math.max(0, this.options.intervalMs - (Date.now() - this.lastEdit)));
+    this.timer.unref();
+  }
+  async stop() {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = void 0;
+    this.options.signal?.removeEventListener("abort", this.abort);
+    await this.inFlight;
+  }
+};
+
 // index.ts
 import {
   resolveInboundRouteEnvelopeBuilderWithRuntime
@@ -606,6 +720,9 @@ function validateConfig() {
   if (config.auth && !["service-account", "user-oauth"].includes(config.auth.mode)) throw new Error("Invalid authentication mode");
   if (authMode() === "user-oauth" && (!config.oauth?.clientId || !config.oauth.clientSecret || !config.oauth.tokensFile)) throw new Error("User OAuth configuration is incomplete");
   if (authMode() === "service-account" && (config.reactionsEnabled || config.media?.outboundEnabled)) throw new Error("App authentication does not support user-only reactions/uploads");
+  for (const value of [config.progress?.enabled, config.progress?.includeDetails]) {
+    if (value !== void 0 && typeof value !== "boolean") throw new Error("Invalid progress setting");
+  }
   for (const [value, min, max] of [
     [config.pollIntervalSeconds ?? 3, 1, 300],
     [config.agentTimeoutSeconds ?? 60, 10, 3600],
@@ -613,7 +730,9 @@ function validateConfig() {
     [config.renewalBufferMinutes ?? 30, 1, 60],
     [mediaLimit(), 1, 200 * 1024 * 1024],
     [config.media?.maxAttachments ?? 5, 1, 10],
-    [config.media?.retentionHours ?? 24, 1, 168]
+    [config.media?.retentionHours ?? 24, 1, 168],
+    [config.progress?.updateIntervalSeconds ?? 5, 2, 30],
+    [config.progress?.maxRecentActivities ?? 3, 1, 8]
   ]) {
     if (!Number.isInteger(value) || value < min || value > max) throw new Error("Invalid numeric limit in plugin configuration");
   }
@@ -1071,12 +1190,13 @@ async function processMessageInPipeline(params) {
       logger.info(`\u{1F9F5} replyInThread: continuing in existing thread ${threadName}`);
     }
   }
+  const progressEnabled = config.progress?.enabled === true;
   const silentReply = config.silentReply !== false;
   let typingMessageName;
-  if (!silentReply) {
+  if ((progressEnabled || !silentReply) && !activeAbort?.signal.aborted) {
     try {
       const botToken = await getBotToken();
-      const typingBody = { text: "_typing..._" };
+      const typingBody = { text: progressEnabled ? "_OpenClaw is working\u2026_" : "_typing..._" };
       if (replyThreadName) typingBody.thread = { name: replyThreadName };
       const typingUrl = replyThreadName ? `https://chat.googleapis.com/v1/${space}/messages?messageReplyOption=${replyMessageOption}` : `https://chat.googleapis.com/v1/${space}/messages`;
       logger.info(`\u23F3 Sending typing indicator to ${space} (thread: ${replyThreadName || "none"}, replyInThread: ${replyInThread})`);
@@ -1087,7 +1207,9 @@ async function processMessageInPipeline(params) {
       });
       logger.info(`\u23F3 Typing indicator result: status=${result.status} name=${result.data?.name || "none"}`);
       if (result.status < 400 && result.data?.name) {
+        assertChatMessage(result.data, space);
         typingMessageName = result.data.name;
+        markProcessed(typingMessageName);
         if (replyInThread && result.data?.thread?.name && !replyThreadName) {
           replyThreadName = result.data.thread.name;
         }
@@ -1100,6 +1222,24 @@ async function processMessageInPipeline(params) {
   } else {
     logger.info(`\u{1F507} silentReply=true \u2014 skipping typing indicator`);
   }
+  const progress = progressEnabled && typingMessageName ? new ActivityProgress({
+    intervalMs: (config.progress?.updateIntervalSeconds ?? 5) * 1e3,
+    maxRecent: config.progress?.maxRecentActivities ?? 3,
+    includeDetails: config.progress?.includeDetails !== false,
+    signal: activeAbort?.signal,
+    update: async (text2) => {
+      const token = await getBotToken();
+      if (activeAbort?.signal.aborted) throw new Error("Progress cancelled");
+      const result = await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}` },
+        body: { text: text2 }
+      });
+      if (result.status >= 400) throw new ApiError("Chat progress", result.status);
+      assertChatMessage(result.data, space);
+    },
+    onError: (error) => logger.warn(`Activity updates stopped: ${safeError(error)}`)
+  }) : void 0;
   const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
     cfg,
     agentId: route.agentId,
@@ -1107,82 +1247,113 @@ async function processMessageInPipeline(params) {
     accountId: agentId
   });
   let pipelineError;
-  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-    ctx: ctxPayload,
-    cfg,
-    dispatcherOptions: {
-      ...prefixOptions,
-      deliver: async (payload, info) => {
-        logger.debug(`Reply delivery: kind=${info?.kind || "unknown"}`);
-        if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
-        assertDestination(space, threadName || void 0);
-        const botToken = await getBotToken();
-        const replyText = payload.text?.trim();
-        const mediaRefs = [
-          ...payload.mediaUrls || [],
-          ...payload.mediaUrl ? [payload.mediaUrl] : []
-        ].filter((m) => Boolean(m && String(m).trim()));
-        const uniqueMediaRefs = [...new Set(mediaRefs)];
-        if (uniqueMediaRefs.length > 0) {
-          requireOutboundMedia();
-          const effectiveThread = replyThreadName || void 0;
-          if (typingMessageName) {
-            await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${botToken}` }
-            }).catch(() => {
-            });
-            typingMessageName = void 0;
-          }
-          if (replyText) deliveredChunks.push(replyText);
-          const result = await sendMediaMessages({
-            space,
-            mediaRefs: uniqueMediaRefs,
-            token: await getOAuthToken(),
-            text: replyText,
-            threadName: effectiveThread,
-            replyMessageOption
-          });
-          if (result.failed.length) throw new Error("One or more media deliveries failed");
-          logger.info(
-            `\u{1F4CE} Media delivery: ${result.sent}/${uniqueMediaRefs.length} sent` + (result.failed.length ? ` | failures: ${result.failed.join("; ").slice(0, 300)}` : "")
-          );
-          return;
-        }
-        if (!replyText) return;
-        deliveredChunks.push(replyText);
-        const chunkLimit = 4e3;
-        const chunks = [];
-        if (replyText.length <= chunkLimit) {
-          chunks.push(replyText);
-        } else {
-          let remaining = replyText;
-          while (remaining.length > 0) {
-            if (remaining.length <= chunkLimit) {
-              chunks.push(remaining);
-              break;
+  try {
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        ...prefixOptions,
+        deliver: async (payload, info) => {
+          logger.debug(`Reply delivery: kind=${info?.kind || "unknown"}`);
+          if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+          assertDestination(space, threadName || void 0);
+          const botToken = await getBotToken();
+          const replyText = payload.text?.trim();
+          const mediaRefs = [
+            ...payload.mediaUrls || [],
+            ...payload.mediaUrl ? [payload.mediaUrl] : []
+          ].filter((m) => Boolean(m && String(m).trim()));
+          const uniqueMediaRefs = [...new Set(mediaRefs)];
+          if (uniqueMediaRefs.length > 0) {
+            await progress?.stop();
+            if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+            requireOutboundMedia();
+            const effectiveThread = replyThreadName || void 0;
+            if (typingMessageName) {
+              await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${botToken}` }
+              }).catch(() => {
+              });
+              typingMessageName = void 0;
             }
-            let cut = remaining.lastIndexOf("\n", chunkLimit);
-            if (cut <= 0) cut = chunkLimit;
-            chunks.push(remaining.slice(0, cut));
-            remaining = remaining.slice(cut).trimStart();
+            if (replyText) deliveredChunks.push(replyText);
+            const result = await sendMediaMessages({
+              space,
+              mediaRefs: uniqueMediaRefs,
+              token: await getOAuthToken(),
+              text: replyText,
+              threadName: effectiveThread,
+              replyMessageOption
+            });
+            if (result.failed.length) throw new Error("One or more media deliveries failed");
+            logger.info(
+              `\u{1F4CE} Media delivery: ${result.sent}/${uniqueMediaRefs.length} sent` + (result.failed.length ? ` | failures: ${result.failed.join("; ").slice(0, 300)}` : "")
+            );
+            return;
           }
-        }
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          try {
-            if (i === 0 && typingMessageName) {
-              logger.info(`\u{1F4DD} PATCHing typing message: ${typingMessageName}`);
-              const patchResult = await httpJson(
-                `https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`,
-                {
-                  method: "PATCH",
-                  headers: { Authorization: `Bearer ${botToken}` },
-                  body: { text: chunk }
+          if (!replyText) return;
+          await progress?.stop();
+          if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+          deliveredChunks.push(replyText);
+          const chunkLimit = 4e3;
+          const chunks = [];
+          if (replyText.length <= chunkLimit) {
+            chunks.push(replyText);
+          } else {
+            let remaining = replyText;
+            while (remaining.length > 0) {
+              if (remaining.length <= chunkLimit) {
+                chunks.push(remaining);
+                break;
+              }
+              let cut = remaining.lastIndexOf("\n", chunkLimit);
+              if (cut <= 0) cut = chunkLimit;
+              chunks.push(remaining.slice(0, cut));
+              remaining = remaining.slice(cut).trimStart();
+            }
+          }
+          for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            try {
+              if (i === 0 && typingMessageName) {
+                logger.info(`\u{1F4DD} PATCHing typing message: ${typingMessageName}`);
+                const patchResult = await httpJson(
+                  `https://chat.googleapis.com/v1/${typingMessageName}?updateMask=text`,
+                  {
+                    method: "PATCH",
+                    headers: { Authorization: `Bearer ${botToken}` },
+                    body: { text: chunk }
+                  }
+                );
+                if (patchResult.status >= 400) {
+                  logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
+                  const msgBody = { text: chunk };
+                  let url = `https://chat.googleapis.com/v1/${space}/messages`;
+                  const effectiveThread = replyThreadName || void 0;
+                  if (effectiveThread) {
+                    msgBody.thread = { name: effectiveThread };
+                    url += `?messageReplyOption=${replyMessageOption}`;
+                  }
+                  const postResult = await httpJson(url, {
+                    method: "POST",
+                    headers: { Authorization: `Bearer ${botToken}` },
+                    body: msgBody
+                  });
+                  if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
+                  assertChatMessage(postResult.data, space);
+                  logger.info(`POST fallback result: ${postResult.status}`);
+                  await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+                    method: "DELETE",
+                    headers: { Authorization: `Bearer ${botToken}` }
+                  }).catch(() => {
+                  });
+                } else {
+                  assertChatMessage(patchResult.data, space);
+                  logger.info(`\u2705 PATCH succeeded`);
                 }
-              );
-              if (patchResult.status >= 400) {
-                logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
+                typingMessageName = void 0;
+              } else {
                 const msgBody = { text: chunk };
                 let url = `https://chat.googleapis.com/v1/${space}/messages`;
                 const effectiveThread = replyThreadName || void 0;
@@ -1197,80 +1368,61 @@ async function processMessageInPipeline(params) {
                 });
                 if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
                 assertChatMessage(postResult.data, space);
-                logger.info(`POST fallback result: ${postResult.status}`);
-              } else {
-                assertChatMessage(patchResult.data, space);
-                logger.info(`\u2705 PATCH succeeded`);
+                logger.info(`\u{1F4E8} POST result: ${postResult.status}`);
               }
-              typingMessageName = void 0;
-            } else {
-              const msgBody = { text: chunk };
-              let url = `https://chat.googleapis.com/v1/${space}/messages`;
-              const effectiveThread = replyThreadName || void 0;
-              if (effectiveThread) {
-                msgBody.thread = { name: effectiveThread };
-                url += `?messageReplyOption=${replyMessageOption}`;
-              }
-              const postResult = await httpJson(url, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${botToken}` },
-                body: msgBody
-              });
-              if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
-              assertChatMessage(postResult.data, space);
-              logger.info(`\u{1F4E8} POST result: ${postResult.status}`);
+            } catch (err) {
+              logger.error(`Chat API reply failed: ${safeError(err)}`);
+              pipelineError = new Error("Chat API reply failed");
+              throw pipelineError;
             }
-          } catch (err) {
-            logger.error(`Chat API reply failed: ${safeError(err)}`);
-            pipelineError = new Error("Chat API reply failed");
-            throw pipelineError;
           }
+        },
+        onSkip: (payload, info) => {
+          logger.debug(`Reply skipped: kind=${info?.kind || "unknown"}`);
+        },
+        onHeartbeatStrip: () => {
+          logger.info(`\u{1F493} Heartbeat strip triggered`);
+        },
+        onError: (err, info) => {
+          pipelineError = new Error("Agent or reply delivery failed");
+          logger.error(
+            `googlechatpubsub reply ${info?.kind || "?"} failed: ${safeError(err)}`
+          );
         }
       },
-      onSkip: (payload, info) => {
-        logger.debug(`Reply skipped: kind=${info?.kind || "unknown"}`);
-      },
-      onHeartbeatStrip: () => {
-        logger.info(`\u{1F493} Heartbeat strip triggered`);
-      },
-      onError: (err, info) => {
-        pipelineError = new Error("Agent or reply delivery failed");
-        logger.error(
-          `googlechatpubsub reply ${info?.kind || "?"} failed: ${safeError(err)}`
-        );
-        if (typingMessageName) {
-          getBotToken().then(
-            (t) => httpJson(
-              `https://chat.googleapis.com/v1/${typingMessageName}`,
-              {
-                method: "DELETE",
-                headers: { Authorization: `Bearer ${t}` }
-              }
-            )
-          ).catch(() => {
-          });
+      replyOptions: {
+        onModelSelected,
+        ...progressEnabled ? {
+          suppressDefaultToolProgressMessages: true,
+          suppressToolProgressMessages: true,
+          allowToolLifecycleWhenProgressHidden: true,
+          commentaryProgressEnabled: false,
+          progressPreambleEnabled: false,
+          commentaryPayloadsEnabled: false,
+          reasoningPayloadsEnabled: false,
+          onToolStart: (event) => progress?.onToolStart(event) ?? false,
+          onItemEvent: (event) => progress?.onItemEvent(event) ?? false
+        } : {},
+        abortSignal: activeAbort?.signal,
+        onAgentRunTerminalOutcome: (outcome) => {
+          if (outcome === "failed") pipelineError = new Error("Agent run failed");
         }
       }
-    },
-    replyOptions: {
-      onModelSelected,
-      abortSignal: activeAbort?.signal,
-      onAgentRunTerminalOutcome: (outcome) => {
-        if (outcome === "failed") pipelineError = new Error("Agent run failed");
+    });
+  } finally {
+    await progress?.stop();
+    if (typingMessageName) {
+      logger.info(`\u{1F9F9} Cleaning up orphaned typing message: ${typingMessageName}`);
+      try {
+        const cleanupToken = await getBotToken();
+        await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${cleanupToken}` }
+        });
+        logger.info(`\u2705 Orphaned typing message deleted`);
+      } catch (err) {
+        logger.error(`Failed to delete orphaned typing message: ${safeError(err)}`);
       }
-    }
-  });
-  if (typingMessageName) {
-    logger.info(`\u{1F9F9} Cleaning up orphaned typing message: ${typingMessageName}`);
-    try {
-      const cleanupToken = await getBotToken();
-      await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${cleanupToken}` }
-      });
-      logger.info(`\u2705 Orphaned typing message deleted`);
-    } catch (err) {
-      logger.error(`Failed to delete orphaned typing message: ${safeError(err)}`);
     }
   }
   if (pipelineError) throw pipelineError;

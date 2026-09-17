@@ -138,6 +138,35 @@ Before enabling an existing installation:
 3. Protect the service-account key, OAuth token file, configuration and state backups. OAuth client secrets remain in your configuration unless your host provides a compatible secret mechanism.
 4. Stop the old listener before switching. Old in-memory queued work was not durable. Subscription discovery locates a matching server-side subscription even if the old state file is absent.
 
+## Live activity without extra messages
+
+Set `progress.enabled` in `channels.googlechatpubsub` to show one editable status message while the agent works. This takes precedence over `silentReply` and works with both space-level and threaded replies:
+
+```json
+"progress": {
+  "enabled": true,
+  "updateIntervalSeconds": 5,
+  "maxRecentActivities": 3,
+  "includeDetails": true
+}
+```
+
+A typical status looks like:
+
+```text
+OpenClaw is working…
+Commands ×8 · Memory Search ×2
+✓ Memory Search — Conference attendee list
+✓ Commands — Check background worker status
+… Commands — Restart background worker
+```
+
+Counts reflect observed tool invocations, not successful execution. A checkmark requires an explicit completion event; `!` means failed/blocked/cancelled. Repeated lifecycle events for the same tool call count once. Only the most recent activities remain visible. Changes are coalesced into at most one edit per five seconds by default; unchanged status is not reposted. The first text answer replaces the status, and longer answers still use normal message chunking. Later tool events cannot overwrite an answer. Attachment replies retire the status before posting attachments. Silent responses, errors and cancellation clean it up when the run settles.
+
+Details use tool-provided human-readable `title` fields (for example, an exec title) and queries for memory/web/tool searches. Titles depend on the agent/backend; absent titles fall back to tool names. Raw commands, other arguments, results, SDK item metadata and reasoning are never forwarded. Common credential patterns and Chat markup are filtered, but selected titles/queries can still contain business context: use `includeDetails: false` for names/counts only. No extra model calls are made to invent activity descriptions.
+
+Activity is opt-in (`enabled: false` by default). The edit interval accepts 2–30 seconds and recent activity count accepts 1–8. Tracking is bounded to 10,000 distinct invocations per run. Failed status creation/editing does not fail the agent or repeatedly post replacement status messages; final delivery still proceeds normally. This uses the app's existing `chat.bot` authorization to [edit its own message](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/patch), without additional scopes.
+
 ## Delivery, recovery and subscriptions
 
 The listener atomically saves **all routed jobs before Pub/Sub ACK**. Files are flushed and renamed with restrictive permissions under `<OpenClaw state>/googlechatpubsub/`. Use local persistent storage with working atomic rename/fsync semantics; ephemeral storage loses acknowledged work. A host lock prevents two processes from owning the same inbox. A shared network filesystem or multi-host consumer group is not supported.
