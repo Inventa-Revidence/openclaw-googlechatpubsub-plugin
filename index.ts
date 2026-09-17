@@ -404,6 +404,11 @@ function assertDestination(space: string, thread?: string): void {
   if (!SPACE_RE.test(space) || !config.bindings.some(b => b.space === space)) throw new Error("Destination space is not configured");
   assertResource(space, thread || undefined, "threads");
 }
+/** Validate supplied context even when space-level replies ignore its thread. */
+function resolveReplyThread(space: string, thread?: string): string | undefined {
+  assertDestination(space, thread);
+  return config.bindings.find(binding => binding.space === space)?.replyInThread ? thread : undefined;
+}
 function assertChatMessage(data: any, space: string): string {
   if (typeof data?.name !== "string" || !data.name) throw new Error("Chat response has no message identity; delivery outcome uncertain");
   assertResource(space, data.name, "messages");
@@ -1000,8 +1005,8 @@ async function processMessageInPipeline(params: {
     Surface: "googlechatpubsub",
     MessageSid: messageName,
     MessageSidFull: messageName,
-    ReplyToId: threadName || undefined,
-    ReplyToIdFull: threadName || undefined,
+    ReplyToId: replyInThread ? threadName || undefined : undefined,
+    ReplyToIdFull: replyInThread ? threadName || undefined : undefined,
     GroupSpace: spaceDisplayName || undefined,
     OriginatingChannel: "googlechatpubsub",
     OriginatingTo: `googlechatpubsub:${space}`,
@@ -1027,8 +1032,8 @@ async function processMessageInPipeline(params: {
   // 4) Determine reply thread target
   //    replyInThread=true + no existing thread → create new thread on the original message
   //    replyInThread=true + existing thread → reply in that thread
-  //    replyInThread=false → reply in main window (use thread only if message was already in one)
-  let replyThreadName = threadName; // default: follow the incoming message's thread
+  //    replyInThread=false → omit thread routing, even when the event includes a thread
+  let replyThreadName = replyInThread ? threadName : "";
   let replyMessageOption = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
 
   if (replyInThread) {
@@ -1059,16 +1064,12 @@ async function processMessageInPipeline(params: {
     try {
       const botToken = await getBotToken();
       const typingBody: any = { text: "_typing..._" };
-      if (replyInThread && replyThreadName) {
-        typingBody.thread = { name: replyThreadName };
-      } else if (threadName) {
-        typingBody.thread = { name: threadName };
-      }
-      const typingUrl = replyInThread && replyThreadName
+      if (replyThreadName) typingBody.thread = { name: replyThreadName };
+      const typingUrl = replyThreadName
         ? `https://chat.googleapis.com/v1/${space}/messages?messageReplyOption=${replyMessageOption}`
         : `https://chat.googleapis.com/v1/${space}/messages`;
 
-      logger.info(`⏳ Sending typing indicator to ${space} (thread: ${replyThreadName || threadName || 'none'}, replyInThread: ${replyInThread})`);
+      logger.info(`⏳ Sending typing indicator to ${space} (thread: ${replyThreadName || 'none'}, replyInThread: ${replyInThread})`);
       const result = await httpJson(typingUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${botToken}` },
@@ -1078,7 +1079,7 @@ async function processMessageInPipeline(params: {
       if (result.status < 400 && result.data?.name) {
         typingMessageName = result.data.name;
         // Capture the actual thread name from the response (important for new threads)
-        if (result.data?.thread?.name && !replyThreadName) {
+        if (replyInThread && result.data?.thread?.name && !replyThreadName) {
           replyThreadName = result.data.thread.name;
         }
       } else {
@@ -1127,7 +1128,7 @@ async function processMessageInPipeline(params: {
         if (uniqueMediaRefs.length > 0) {
           requireOutboundMedia();
           // Media path: attachments carry the text as the first message's caption.
-          const effectiveThread = replyInThread ? replyThreadName : threadName;
+          const effectiveThread = replyThreadName || undefined;
 
           // Retire the typing placeholder first so the attachment is not orphaned behind it.
           if (typingMessageName) {
@@ -1199,7 +1200,7 @@ async function processMessageInPipeline(params: {
                 // Fallback: send as new message
                 const msgBody: any = { text: chunk };
                 let url = `https://chat.googleapis.com/v1/${space}/messages`;
-                const effectiveThread = replyInThread ? replyThreadName : threadName;
+                const effectiveThread = replyThreadName || undefined;
                 if (effectiveThread) {
                   msgBody.thread = { name: effectiveThread };
                   url += `?messageReplyOption=${replyMessageOption}`;
@@ -1220,7 +1221,7 @@ async function processMessageInPipeline(params: {
             } else {
               const msgBody: any = { text: chunk };
               let url = `https://chat.googleapis.com/v1/${space}/messages`;
-              const effectiveThread = replyInThread ? replyThreadName : threadName;
+              const effectiveThread = replyThreadName || undefined;
               if (effectiveThread) {
                 msgBody.thread = { name: effectiveThread };
                 url += `?messageReplyOption=${replyMessageOption}`;
@@ -1231,7 +1232,7 @@ async function processMessageInPipeline(params: {
                 body: msgBody,
               });
               if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
-                assertChatMessage(postResult.data, space);
+              assertChatMessage(postResult.data, space);
               logger.info(`📨 POST result: ${postResult.status}`);
             }
           } catch (err: any) {
@@ -1374,6 +1375,9 @@ function startInboxWorker(): void {
           inbox!.update(record.id, { state: "done", reason: "admission revoked" });
           continue;
         }
+        // Pending jobs may predate a reply-policy change; use the current binding.
+        msg.replyInThread = current.replyInThread ?? false;
+        msg.threadSessionIsolation = current.threadSessionIsolation ?? msg.replyInThread;
         inbox!.update(record.id, { attempts });
         if (msg.rawAttachments?.length && config.media?.inboundEnabled) {
           const token = authMode() === "service-account" ? await getBotToken() : await getOAuthToken();
@@ -1549,8 +1553,8 @@ export default function register(api: any) {
         try {
           const token = await getBotToken();
           const space = target;
-          // Respect replyInThread: if threadId/replyTo is provided, reply in that thread.
-          const replyToThread = params.threadId || params.replyTo;
+          // Space-level mode also ignores thread context supplied by the host or a tool.
+          const replyToThread = resolveReplyThread(space, params.threadId || params.replyTo);
           const binding = config?.bindings?.find((b: any) => b.space === space);
           const bindingReplyInThread = binding?.replyInThread ?? false;
           const msgBody: any = { text };
@@ -1597,7 +1601,7 @@ export default function register(api: any) {
           // attachments:upload requires user auth, not the bot service account.
           const token = await getOAuthToken();
           const binding = config?.bindings?.find((b: any) => b.space === target);
-          const replyToThread = params.threadId || params.replyTo;
+          const replyToThread = resolveReplyThread(target, params.threadId || params.replyTo);
           const threadName = replyToThread ? String(replyToThread) : undefined;
           if (binding?.replyInThread && !replyToThread) {
             logger.warn(
@@ -1641,7 +1645,7 @@ export default function register(api: any) {
           assertDestination(space, threadId || replyTo);
           const token = await getBotToken();
 
-          const replyToThread = threadId || replyTo;
+          const replyToThread = resolveReplyThread(space, threadId || replyTo);
           const binding = config?.bindings?.find((b: any) => b.space === space);
           const bindingReplyInThread = binding?.replyInThread ?? false;
           const msgBody: any = { text };
@@ -1678,7 +1682,7 @@ export default function register(api: any) {
           const token = await getOAuthToken();
           if (!mediaUrl) return { ok: false };
 
-          const replyToThread = threadId || replyTo;
+          const replyToThread = resolveReplyThread(space, threadId || replyTo);
           const binding = config?.bindings?.find((b: any) => b.space === space);
           if (binding?.replyInThread && !replyToThread) {
             logger.warn(

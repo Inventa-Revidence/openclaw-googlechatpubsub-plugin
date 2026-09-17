@@ -82,6 +82,23 @@ A minimal service-account configuration (all IDs and paths below are placeholder
 
 Merge these keys into existing configuration; preserve other plugins and bindings. OpenClaw's top-level agent bindings are separate from this plugin's space/keyword bindings. For multiple agents, add corresponding top-level bindings and use `mentionKeyword`, `alwaysListen`, or both within each space. Use stable numeric Chat `users/<id>` resource names from the Chat API, not email addresses or display names.
 
+### Reply in the space or in a thread
+
+Set these fields on the relevant `channels.googlechatpubsub.bindings[]` entry to post answers directly in the space and share one conversation session across that space:
+
+```json
+{
+  "replyInThread": false,
+  "threadSessionIsolation": false
+}
+```
+
+`replyInThread: false` is the default. It omits thread routing from outgoing messages even when the incoming event, OpenClaw, or a message action supplies a thread ID. This applies to text, attachments, caption fallbacks, typing placeholders and later reply chunks. Older versions still followed incoming thread IDs when this setting was false; install this revision to get space-level replies.
+
+Google represents a new space-level post as the start of a new thread; the bot's answer appears in the main space conversation instead of as a nested reply. The plugin does not reuse the thread returned for a typing placeholder when space-level mode is enabled. See Google's [message reply options](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create#messagereplyoption).
+
+Set `replyInThread: true` to keep replies within the incoming thread. `threadSessionIsolation` controls agent conversation history independently and defaults to the value of `replyInThread`. Existing configurations that explicitly set it to true must also change it to false if one shared space session is wanted. Queued jobs use the current binding's reply/session settings when processing resumes.
+
 ### Admission and command policy
 
 - Only `google.workspace.chat.message.v1.created` events from configured spaces and human senders are considered. Message/thread names must belong to that space. Message text is limited to 32 KiB; the encoded event is limited to 90,000 characters.

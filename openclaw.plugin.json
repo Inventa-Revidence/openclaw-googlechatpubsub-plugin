@@ -101,7 +101,7 @@
                 "replyInThread": {
                   "type": "boolean",
                   "default": false,
-                  "description": "When true, replies are always posted in a thread."
+                  "description": "When true, reply in the incoming thread. When false (default), post directly in the space and ignore incoming or supplied thread context."
                 },
                 "threadSessionIsolation": {
                   "type": "boolean",
@@ -394,7 +394,7 @@
             "replyInThread": {
               "type": "boolean",
               "default": false,
-              "description": "When true, replies are always posted in a thread."
+              "description": "When true, reply in the incoming thread. When false (default), post directly in the space and ignore incoming or supplied thread context."
             },
             "threadSessionIsolation": {
               "type": "boolean",

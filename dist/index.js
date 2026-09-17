@@ -557,6 +557,10 @@ function assertDestination(space, thread) {
   if (!SPACE_RE.test(space) || !config.bindings.some((b) => b.space === space)) throw new Error("Destination space is not configured");
   assertResource(space, thread || void 0, "threads");
 }
+function resolveReplyThread(space, thread) {
+  assertDestination(space, thread);
+  return config.bindings.find((binding) => binding.space === space)?.replyInThread ? thread : void 0;
+}
 function assertChatMessage(data, space) {
   if (typeof data?.name !== "string" || !data.name) throw new Error("Chat response has no message identity; delivery outcome uncertain");
   assertResource(space, data.name, "messages");
@@ -1034,8 +1038,8 @@ async function processMessageInPipeline(params) {
     Surface: "googlechatpubsub",
     MessageSid: messageName,
     MessageSidFull: messageName,
-    ReplyToId: threadName || void 0,
-    ReplyToIdFull: threadName || void 0,
+    ReplyToId: replyInThread ? threadName || void 0 : void 0,
+    ReplyToIdFull: replyInThread ? threadName || void 0 : void 0,
     GroupSpace: spaceDisplayName || void 0,
     OriginatingChannel: "googlechatpubsub",
     OriginatingTo: `googlechatpubsub:${space}`,
@@ -1055,7 +1059,7 @@ async function processMessageInPipeline(params) {
       `googlechatpubsub: failed updating session meta: ${safeError(err)}`
     );
   });
-  let replyThreadName = threadName;
+  let replyThreadName = replyInThread ? threadName : "";
   let replyMessageOption = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD";
   if (replyInThread) {
     if (!threadName) {
@@ -1073,13 +1077,9 @@ async function processMessageInPipeline(params) {
     try {
       const botToken = await getBotToken();
       const typingBody = { text: "_typing..._" };
-      if (replyInThread && replyThreadName) {
-        typingBody.thread = { name: replyThreadName };
-      } else if (threadName) {
-        typingBody.thread = { name: threadName };
-      }
-      const typingUrl = replyInThread && replyThreadName ? `https://chat.googleapis.com/v1/${space}/messages?messageReplyOption=${replyMessageOption}` : `https://chat.googleapis.com/v1/${space}/messages`;
-      logger.info(`\u23F3 Sending typing indicator to ${space} (thread: ${replyThreadName || threadName || "none"}, replyInThread: ${replyInThread})`);
+      if (replyThreadName) typingBody.thread = { name: replyThreadName };
+      const typingUrl = replyThreadName ? `https://chat.googleapis.com/v1/${space}/messages?messageReplyOption=${replyMessageOption}` : `https://chat.googleapis.com/v1/${space}/messages`;
+      logger.info(`\u23F3 Sending typing indicator to ${space} (thread: ${replyThreadName || "none"}, replyInThread: ${replyInThread})`);
       const result = await httpJson(typingUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${botToken}` },
@@ -1088,7 +1088,7 @@ async function processMessageInPipeline(params) {
       logger.info(`\u23F3 Typing indicator result: status=${result.status} name=${result.data?.name || "none"}`);
       if (result.status < 400 && result.data?.name) {
         typingMessageName = result.data.name;
-        if (result.data?.thread?.name && !replyThreadName) {
+        if (replyInThread && result.data?.thread?.name && !replyThreadName) {
           replyThreadName = result.data.thread.name;
         }
       } else {
@@ -1125,7 +1125,7 @@ async function processMessageInPipeline(params) {
         const uniqueMediaRefs = [...new Set(mediaRefs)];
         if (uniqueMediaRefs.length > 0) {
           requireOutboundMedia();
-          const effectiveThread = replyInThread ? replyThreadName : threadName;
+          const effectiveThread = replyThreadName || void 0;
           if (typingMessageName) {
             await httpJson(`https://chat.googleapis.com/v1/${typingMessageName}`, {
               method: "DELETE",
@@ -1185,7 +1185,7 @@ async function processMessageInPipeline(params) {
                 logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
                 const msgBody = { text: chunk };
                 let url = `https://chat.googleapis.com/v1/${space}/messages`;
-                const effectiveThread = replyInThread ? replyThreadName : threadName;
+                const effectiveThread = replyThreadName || void 0;
                 if (effectiveThread) {
                   msgBody.thread = { name: effectiveThread };
                   url += `?messageReplyOption=${replyMessageOption}`;
@@ -1206,7 +1206,7 @@ async function processMessageInPipeline(params) {
             } else {
               const msgBody = { text: chunk };
               let url = `https://chat.googleapis.com/v1/${space}/messages`;
-              const effectiveThread = replyInThread ? replyThreadName : threadName;
+              const effectiveThread = replyThreadName || void 0;
               if (effectiveThread) {
                 msgBody.thread = { name: effectiveThread };
                 url += `?messageReplyOption=${replyMessageOption}`;
@@ -1362,6 +1362,8 @@ function startInboxWorker() {
           inbox.update(record.id, { state: "done", reason: "admission revoked" });
           continue;
         }
+        msg.replyInThread = current.replyInThread ?? false;
+        msg.threadSessionIsolation = current.threadSessionIsolation ?? msg.replyInThread;
         inbox.update(record.id, { attempts });
         if (msg.rawAttachments?.length && config.media?.inboundEnabled) {
           const token = authMode() === "service-account" ? await getBotToken() : await getOAuthToken();
@@ -1534,7 +1536,7 @@ function register(api) {
         try {
           const token = await getBotToken();
           const space = target;
-          const replyToThread = params.threadId || params.replyTo;
+          const replyToThread = resolveReplyThread(space, params.threadId || params.replyTo);
           const binding = config?.bindings?.find((b) => b.space === space);
           const bindingReplyInThread = binding?.replyInThread ?? false;
           const msgBody = { text };
@@ -1575,7 +1577,7 @@ function register(api) {
         try {
           const token = await getOAuthToken();
           const binding = config?.bindings?.find((b) => b.space === target);
-          const replyToThread = params.threadId || params.replyTo;
+          const replyToThread = resolveReplyThread(target, params.threadId || params.replyTo);
           const threadName = replyToThread ? String(replyToThread) : void 0;
           if (binding?.replyInThread && !replyToThread) {
             logger.warn(
@@ -1615,7 +1617,7 @@ function register(api) {
           if (!space) return { ok: false };
           assertDestination(space, threadId || replyTo);
           const token = await getBotToken();
-          const replyToThread = threadId || replyTo;
+          const replyToThread = resolveReplyThread(space, threadId || replyTo);
           const binding = config?.bindings?.find((b) => b.space === space);
           const bindingReplyInThread = binding?.replyInThread ?? false;
           const msgBody = { text };
@@ -1648,7 +1650,7 @@ function register(api) {
           assertDestination(space, threadId || replyTo);
           const token = await getOAuthToken();
           if (!mediaUrl) return { ok: false };
-          const replyToThread = threadId || replyTo;
+          const replyToThread = resolveReplyThread(space, threadId || replyTo);
           const binding = config?.bindings?.find((b) => b.space === space);
           if (binding?.replyInThread && !replyToThread) {
             logger.warn(
