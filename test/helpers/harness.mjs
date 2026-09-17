@@ -8,7 +8,7 @@
  * module that re-exports those symbols, and import that. See test/README.md.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync, rmSync, readdirSync } from "node:fs";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -38,7 +38,8 @@ function mtime(p) {
 
 /** Keep dist/index.js in sync with index.ts so tests measure current source. */
 function ensureFreshBundle() {
-  if (mtime(BUNDLE) >= mtime(SRC_TS) && mtime(BUNDLE) > 0) return;
+  const inputs = [SRC_TS, ...readdirSync(path.join(PLUGIN_DIR, "src")).map(f => path.join(PLUGIN_DIR, "src", f))];
+  if (mtime(BUNDLE) >= Math.max(...inputs.map(mtime)) && mtime(BUNDLE) > 0) return;
   try {
     execFileSync(
       "npm",
@@ -53,29 +54,15 @@ function ensureFreshBundle() {
   }
 }
 
-/**
- * Rewrite the bundle into an importable module.
- *
- * Three surgical edits, and nothing else:
- *  1. Drop `import {...} from "openclaw/..."` SDK imports (unavailable here).
- *     The pattern is deliberately anchored on `from "openclaw/` and uses
- *     [^}]* which cannot cross a closing brace, so `node:fs` / `node:path` /
- *     `node:crypto` imports are provably untouched. A greedier multiline
- *     regex previously ate those and produced `extname is not defined`.
- *  2. Point the hardcoded Google API host at a per-test mock. Every occurrence
- *     of the literal lives inside a template literal, so substituting a
- *     `${globalThis.__GCHAT_BASE__}` interpolation resolves at call time —
- *     each test file can own an ephemeral server without port collisions.
- *  3. Give the uninitialised `logger` a no-op implementation (the real one is
- *     assigned by plugin registration, which we never run).
- */
+/** See test/README.md for the precise mock boundaries. Security helpers remain real. */
 function buildModuleSource() {
   let code = readFileSync(BUNDLE, "utf8");
 
   const before = code;
-  code = code.replace(/import\s*\{[^}]*\}\s*from\s*"openclaw\/[^"]*";/g, "");
+  code = code.replace(/import\s*\{[^}]*\}\s*from\s*"openclaw\/plugin-sdk\/(?:inbound-envelope|channel-outbound)";/g, "");
   if (code === before) throw new Error("harness: no openclaw SDK imports stripped — bundle shape changed?");
-  if (/from\s*"openclaw/.test(code)) throw new Error("harness: an openclaw import survived stripping");
+  // Keep filesystem, SSRF and locking SDK helpers real.
+  code = code.replace('import { fetchWithSsrFGuard }', 'import { fetchWithSsrFGuard as realFetchWithSsrFGuard }');
   for (const builtin of ['"node:fs"', '"node:path"', '"node:crypto"']) {
     if (!code.includes(`from ${builtin}`)) {
       throw new Error(`harness: import of ${builtin} was destroyed by the strip regex`);
@@ -86,6 +73,7 @@ function buildModuleSource() {
     throw new Error("harness: expected hardcoded chat.googleapis.com URLs in bundle");
   }
   code = code.replaceAll("https://chat.googleapis.com", BASE_EXPR);
+  code = code.replaceAll("https://pubsub.googleapis.com", "${globalThis.__PUBSUB_BASE__}");
 
   const loggerBefore = code;
   code = code.replace(/^var logger;/m, "var logger={info(){},warn(){},error(){},debug(){}};");
@@ -100,6 +88,37 @@ function buildModuleSource() {
     "export function __setSelfUserId(v){ selfUserId = v; }\n" +
     "export function __getSelfUserId(){ return selfUserId; }\n" +
     "export function __resetDedup(){ processedMsgIds.clear(); }\n";
+  code += `
+function resolveInboundRouteEnvelopeBuilderWithRuntime(p) {
+  return {route:{agentId:p.accountId,sessionKey:'agent:'+p.accountId+':'+p.peer.id},
+    buildEnvelope: e => ({storePath:'/test/session',body:e.body})};
+}
+function createReplyPrefixOptions() { return {}; }
+async function fetchWithSsrFGuard(p) {
+  // Only binary-format fixtures bypass the guard. Security tests use the real
+  // guard with injected DNS/transport; no production bypass exists.
+  if (globalThis.__TEST_MEDIA_HOSTS__?.has(new URL(p.url).origin)) {
+    const response=await fetch(p.url,{...p.init,signal:p.signal,redirect:'error'});
+    return {response,finalUrl:p.url,release:async()=>{}};
+  }
+  return realFetchWithSsrFGuard({...p,...globalThis.__TEST_GUARD_OVERRIDES__});
+}
+config = {auth:{mode:'user-oauth'},allowFrom:['users/123'],
+  bindings:['spaces/TESTSPACE123','spaces/S'].map(space=>({space,agents:[{agentId:'main',alwaysListen:true}]})),
+  media:{inboundEnabled:true,outboundEnabled:true,allowRemoteUrls:true,localRoots:${JSON.stringify([tmpdir(), PLUGIN_DIR])},maxBytes:200*1024*1024,maxAttachments:10}};
+export {DurableInbox,lockInbox,atomicJson,readBoundedResponse,readMediaFile,fetchMedia,ServiceAccountTokens,AUTH_SCOPES,maintainSubscription,MESSAGE_EVENT,safeError};
+export {crossAgentDispatch,isSenderAllowed,isCommandAuthorized,assertDestination,admittedJobs,validateConfig,pollOnce,startInboxWorker,processMessageInPipeline,getOAuthToken,getPubSubToken};
+export function __configure(p) {
+  if(p.config){config=p.config; routingTable=buildRoutingTable(config.bindings||[]);}
+  if(p.api) pluginApi=p.api;
+  if(p.inbox) inbox=p.inbox;
+  if(p.tokens) authTokens=p.tokens;
+  if(p.logger) logger=p.logger;
+  if('stopping' in p) stopping=p.stopping;
+  fatalInboxError=false; lastRenewalCheck=Date.now();
+}
+export async function __waitWorker(){await workerPromise;}
+`;
   return code;
 }
 
@@ -229,10 +248,13 @@ export async function startMockFileHost(handler) {
     res.end(body);
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  (globalThis.__TEST_MEDIA_HOSTS__ ??= new Set()).add(base);
   return {
-    base: `http://127.0.0.1:${server.address().port}`,
+    base,
     requests,
     async close() {
+      globalThis.__TEST_MEDIA_HOSTS__.delete(base);
       server.closeAllConnections?.();
       await new Promise((r) => server.close(r));
     },

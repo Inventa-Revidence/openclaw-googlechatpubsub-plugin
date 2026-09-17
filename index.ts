@@ -9,9 +9,14 @@
  * No @mention required. Messages arrive via Pub/Sub, not the Chat webhook.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { resolve, join, extname } from "node:path";
-import { createSign, randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync, readdirSync, lstatSync, unlinkSync, chmodSync } from "node:fs";
+import { resolve, join, extname, isAbsolute } from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { atomicJson, privateDirectory, safeError, ApiError, readBoundedResponse, readMediaFile, fetchMedia, assertResource, SPACE_RE, USER_RE, DEFAULT_MEDIA_BYTES } from "./src/safety.js";
+import { ServiceAccountTokens } from "./src/auth.js";
+import { DurableInbox, lockInbox } from "./src/inbox.js";
+import { maintainSubscription, MESSAGE_EVENT } from "./src/subscriptions.js";
 import {
   resolveInboundRouteEnvelopeBuilderWithRuntime,
 } from "openclaw/plugin-sdk/inbound-envelope";
@@ -32,6 +37,9 @@ interface SpaceBinding {
   replyInThread?: boolean;
   threadSessionIsolation?: boolean;
   agents: AgentBinding[];
+  allowFrom?: string[];
+  allowAllSpaceMembers?: boolean;
+  commandAllowFrom?: string[];
 }
 
 interface PubSubConfig {
@@ -42,7 +50,23 @@ interface PubSubConfig {
   pollIntervalSeconds?: number;
   renewalBufferMinutes?: number;
   serviceAccountFile?: string;
-  oauth: {
+  auth?: { mode: "service-account" | "user-oauth" };
+  allowFrom?: string[];
+  allowAllSpaceMembers?: boolean;
+  commandAllowFrom?: string[];
+  reactionsEnabled?: boolean;
+  agentTimeoutSeconds?: number;
+  maxPendingMessages?: number;
+  media?: {
+    inboundEnabled?: boolean;
+    outboundEnabled?: boolean;
+    allowRemoteUrls?: boolean;
+    localRoots?: string[];
+    maxBytes?: number;
+    maxAttachments?: number;
+    retentionHours?: number;
+  };
+  oauth?: {
     clientId: string;
     clientSecret: string;
     redirectUri?: string;
@@ -73,7 +97,6 @@ let serviceAccountFile: string;
 let routingTable: Map<string, RoutingEntry>;
 let targetSpaces: Set<string>;
 let oauthCache: TokenCache = { token: null, expiresAt: 0 };
-let botCache: TokenCache = { token: null, expiresAt: 0 };
 let processedMsgIds = new Set<string>();
 /**
  * Chat member name (`users/<id>`) of the OAuth identity this plugin sends as.
@@ -91,7 +114,16 @@ let lastRenewalCheck = 0;
 let subscriptionState: Record<string, any> = {};
 let logger: any;
 let pluginApi: any; // Store the full api object for runtime access
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let authTokens: ServiceAccountTokens | undefined;
+let oauthRefresh: Promise<string> | undefined;
+let inbox: DurableInbox<QueuedMessage> | undefined;
+let stopping = true;
+let pollRunning = false;
+let workerPromise: Promise<void> | undefined;
+let activeAbort: AbortController | undefined;
+let fatalInboxError = false;
+let releaseInbox: (() => Promise<void>) | undefined;
 
 const MAX_DEDUP = 500;
 
@@ -130,8 +162,7 @@ function rememberSelfIdentity(created: any): void {
     logger?.info(`[self] Resolved own Chat identity: ${selfUserId}`);
   }
 }
-const RENEWAL_INTERVAL = 300_000; // 5 min
-const SUBSCRIPTION_TTL = 14_400; // 4h in seconds
+const RENEWAL_INTERVAL = 60_000; // Inspect server state once per minute
 const STATE_FILE_NAME = "gchat-pubsub-subscription-state.json";
 
 // ── Per-session message queue (prevents drops when session is busy) ──────────
@@ -150,13 +181,13 @@ interface QueuedMessage {
   threadSessionIsolation: boolean;
   attachmentPaths: string[];
   crossDispatchChainKey?: string;
+  rawAttachments?: any[];
 }
 
 /** Sessions currently running a pipeline dispatch */
 const sessionBusy = new Set<string>();
 
 /** Queued messages waiting for a busy session to finish */
-const sessionQueue = new Map<string, QueuedMessage[]>();
 
 /** Cross-agent dispatch chain tracker — prevents infinite loops */
 const crossDispatchChains = new Map<string, Set<string>>();
@@ -174,12 +205,8 @@ function deriveSessionKey(agentId: string, space: string, threadName: string, th
   return `agent:${agentId}:googlechatpubsub:group:${peerId}`.toLowerCase();
 }
 
-/**
- * Process a message through the pipeline, with queue support.
- * If the session is busy, the message is queued and will be processed
- * when the current pipeline completes.
- */
-async function dispatchOrQueue(msg: QueuedMessage): Promise<void> {
+/** The durable worker owns admission; never complete work by enqueueing it in memory. */
+async function dispatchMessage(msg: QueuedMessage): Promise<void> {
   const sessionKey = deriveSessionKey(
     msg.agent.agentId,
     msg.space,
@@ -187,13 +214,7 @@ async function dispatchOrQueue(msg: QueuedMessage): Promise<void> {
     msg.threadSessionIsolation
   );
 
-  if (sessionBusy.has(sessionKey)) {
-    const queue = sessionQueue.get(sessionKey) || [];
-    queue.push(msg);
-    sessionQueue.set(sessionKey, queue);
-    logger.info(`📥 [${msg.agent.agentId}] Queued message for busy session ${sessionKey} (queue depth: ${queue.length})`);
-    return;
-  }
+  if (sessionBusy.has(sessionKey)) throw new Error("Agent session is already busy");
 
   sessionBusy.add(sessionKey);
   try {
@@ -214,56 +235,12 @@ async function dispatchOrQueue(msg: QueuedMessage): Promise<void> {
     });
     logger.info(`✅ [${msg.agent.agentId}] Pipeline complete for ${msg.space}`);
   } catch (err: any) {
-    logger.error(`[${msg.agent.agentId}] Pipeline error: ${err.message}`);
+    logger.error(`[${msg.agent.agentId}] Pipeline error: ${safeError(err)}`);
+    throw err;
   } finally {
     sessionBusy.delete(sessionKey);
   }
 
-  await drainQueue(sessionKey);
-}
-
-/**
- * Process any queued messages for a session that just finished.
- */
-async function drainQueue(sessionKey: string): Promise<void> {
-  const queue = sessionQueue.get(sessionKey);
-  if (!queue || queue.length === 0) {
-    sessionQueue.delete(sessionKey);
-    return;
-  }
-
-  const next = queue.shift()!;
-  if (queue.length === 0) {
-    sessionQueue.delete(sessionKey);
-  }
-
-  logger.info(`📤 [${next.agent.agentId}] Draining queued message for ${sessionKey} (remaining: ${queue?.length ?? 0})`);
-
-  sessionBusy.add(sessionKey);
-  try {
-    await processMessageInPipeline({
-      agentId: next.agent.agentId,
-      space: next.space,
-      spaceDisplayName: next.spaceDisplayName,
-      senderId: next.senderId,
-      senderName: next.senderName,
-      text: next.text,
-      messageName: next.messageName,
-      threadName: next.threadName,
-      eventTime: next.eventTime,
-      replyInThread: next.replyInThread,
-      threadSessionIsolation: next.threadSessionIsolation,
-      attachmentPaths: next.attachmentPaths,
-      crossDispatchChainKey: next.crossDispatchChainKey,
-    });
-    logger.info(`✅ [${next.agent.agentId}] Queued pipeline complete for ${next.space}`);
-  } catch (err: any) {
-    logger.error(`[${next.agent.agentId}] Queued pipeline error: ${err.message}`);
-  } finally {
-    sessionBusy.delete(sessionKey);
-  }
-
-  await drainQueue(sessionKey);
 }
 
 /**
@@ -297,7 +274,7 @@ async function crossAgentDispatch(params: {
   if (!chain) {
     chain = new Set<string>();
     crossDispatchChains.set(chainKey, chain);
-    setTimeout(() => crossDispatchChains.delete(chainKey), CROSS_DISPATCH_TTL_MS);
+    setTimeout(() => crossDispatchChains.delete(chainKey), CROSS_DISPATCH_TTL_MS).unref();
   }
 
   const matches = replyText.matchAll(new RegExp(entry.pattern.source, "gi"));
@@ -325,7 +302,7 @@ async function crossAgentDispatch(params: {
   for (const agent of toDispatch) {
     logger.info(`🔀 [${agent.agentId}] Cross-dispatch from ${sourceAgentId} in ${space}`);
     dispatchPromises.push(
-      dispatchOrQueue({
+      dispatchMessage({
         agent,
         space,
         spaceDisplayName,
@@ -342,7 +319,10 @@ async function crossAgentDispatch(params: {
       })
     );
   }
-  await Promise.all(dispatchPromises);
+  // A rejection must not release ownership while another agent is still running.
+  const outcomes = await Promise.allSettled(dispatchPromises);
+  const failure = outcomes.find((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+  if (failure) throw failure.reason;
 }
 
 // ── HTTP helper (stdlib only) ────────────────────────────────────────────────
@@ -356,116 +336,126 @@ async function httpJson(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json", ...headers },
-      body: body ? JSON.stringify(body) : undefined,
-      signal: controller.signal,
+      method, headers: { "Content-Type": "application/json", ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body), signal: controller.signal,
+      redirect: "error",
     });
-    clearTimeout(timer);
-    const text = await res.text();
+    const text = (await readBoundedResponse(res, 2 * 1024 * 1024)).toString("utf8");
     let data: any;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = text;
-    }
+    try { data = JSON.parse(text); } catch { data = null; }
     return { status: res.status, data };
-  } catch (e: any) {
-    clearTimeout(timer);
-    if (e.name === "AbortError") {
-      throw new Error(`HTTP request timed out after ${timeoutMs}ms: ${method} ${url}`);
-    }
-    throw e;
-  }
+  } finally { clearTimeout(timer); }
 }
 
-async function httpForm(
-  url: string,
-  params: Record<string, string>
-): Promise<any> {
-  const body = new URLSearchParams(params).toString();
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  return res.json();
+async function httpForm(url: string, params: Record<string, string>): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(params).toString(), signal: controller.signal, redirect: "error",
+    });
+    const data = JSON.parse((await readBoundedResponse(res, 64 * 1024)).toString("utf8"));
+    if (!res.ok) throw new ApiError("OAuth token request", res.status);
+    return data;
+  } finally { clearTimeout(timer); }
 }
 
-// ── Auth ─────────────────────────────────────────────────────────────────────
+function authMode(): "service-account" | "user-oauth" {
+  return config.auth?.mode ?? (config.oauth ? "user-oauth" : "service-account");
+}
 
 async function getOAuthToken(): Promise<string> {
-  const now = Date.now() / 1000;
-  if (oauthCache.token && now < oauthCache.expiresAt - 60) {
-    return oauthCache.token;
-  }
-
-  const tokensFile = config.oauth.tokensFile;
-  let tokens: any;
-  try {
-    tokens = JSON.parse(readFileSync(tokensFile, "utf-8"));
-  } catch {
-    throw new Error(`Cannot read OAuth tokens from ${tokensFile}`);
-  }
-
-  const result = await httpForm("https://oauth2.googleapis.com/token", {
-    client_id: config.oauth.clientId,
-    client_secret: config.oauth.clientSecret,
-    refresh_token: tokens.refresh_token,
-    grant_type: "refresh_token",
-  });
-
-  if (!result.access_token) {
-    throw new Error(`OAuth refresh failed: ${JSON.stringify(result)}`);
-  }
-
-  oauthCache.token = result.access_token;
-  oauthCache.expiresAt = now + (result.expires_in || 3600);
-
-  tokens.access_token = result.access_token;
-  if (result.refresh_token) tokens.refresh_token = result.refresh_token;
-  writeFileSync(tokensFile, JSON.stringify(tokens, null, 2));
-
-  logger.info(`OAuth token refreshed (expires in ${result.expires_in}s)`);
-  return result.access_token;
+  if (authMode() !== "user-oauth" || !config.oauth) throw new Error("Feature requires user-oauth authentication");
+  if (oauthCache.token && Date.now() / 1000 < oauthCache.expiresAt - 60) return oauthCache.token;
+  if (oauthRefresh) return oauthRefresh;
+  const oauth = config.oauth;
+  oauthRefresh = (async () => {
+    const st = lstatSync(oauth.tokensFile);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > 64 * 1024) throw new Error("Unsafe OAuth token file");
+    chmodSync(oauth.tokensFile, 0o600);
+    const tokens = JSON.parse(readFileSync(oauth.tokensFile, "utf8"));
+    if (typeof tokens.refresh_token !== "string" || !tokens.refresh_token) throw new Error("Missing OAuth refresh token");
+    const result = await httpForm("https://oauth2.googleapis.com/token", {
+      client_id: oauth.clientId, client_secret: oauth.clientSecret,
+      refresh_token: tokens.refresh_token, grant_type: "refresh_token",
+    });
+    if (typeof result.access_token !== "string" || !result.access_token
+      || !Number.isFinite(result.expires_in) || result.expires_in <= 0) throw new Error("Invalid OAuth access token response");
+    // Refresh tokens can rotate. Access tokens remain in memory only.
+    if (typeof result.refresh_token === "string" && result.refresh_token) tokens.refresh_token = result.refresh_token;
+    delete tokens.access_token;
+    atomicJson(oauth.tokensFile, tokens);
+    oauthCache = { token: result.access_token, expiresAt: Date.now() / 1000 + result.expires_in };
+    return result.access_token as string;
+  })().finally(() => { oauthRefresh = undefined; });
+  return oauthRefresh;
 }
 
-async function getBotToken(): Promise<string> {
-  const now = Date.now() / 1000;
-  if (botCache.token && now < botCache.expiresAt - 60) {
-    return botCache.token;
+function serviceToken(purpose: "chat" | "events" | "pubsub"): Promise<string> {
+  authTokens ??= new ServiceAccountTokens(serviceAccountFile);
+  return authTokens.token(purpose);
+}
+async function getBotToken(): Promise<string> { return serviceToken("chat"); }
+async function getEventsToken(): Promise<string> { return authMode() === "service-account" ? serviceToken("events") : getOAuthToken(); }
+async function getPubSubToken(): Promise<string> { return authMode() === "service-account" ? serviceToken("pubsub") : getOAuthToken(); }
+
+function assertDestination(space: string, thread?: string): void {
+  if (!SPACE_RE.test(space) || !config.bindings.some(b => b.space === space)) throw new Error("Destination space is not configured");
+  assertResource(space, thread || undefined, "threads");
+}
+function assertChatMessage(data: any, space: string): string {
+  if (typeof data?.name !== "string" || !data.name) throw new Error("Chat response has no message identity; delivery outcome uncertain");
+  assertResource(space, data.name, "messages");
+  return data.name;
+}
+function isSenderAllowed(space: string, sender: string): boolean {
+  const binding = config.bindings.find(b => b.space === space);
+  if (!binding || !USER_RE.test(sender)) return false;
+  return (binding.allowAllSpaceMembers ?? config.allowAllSpaceMembers ?? false)
+    || (binding.allowFrom ?? config.allowFrom ?? []).includes(sender);
+}
+function isCommandAuthorized(space: string, sender: string): boolean {
+  return isSenderAllowed(space, sender)
+    && (config.bindings.find(b => b.space === space)?.commandAllowFrom ?? config.commandAllowFrom ?? []).includes(sender);
+}
+function mediaLimit(): number { return config?.media?.maxBytes ?? DEFAULT_MEDIA_BYTES; }
+function requireOutboundMedia(): void {
+  if (!config?.media?.outboundEnabled) throw new Error("Outbound media is disabled");
+  if (authMode() !== "user-oauth") throw new Error("Outbound uploads require user-oauth authentication");
+}
+function requireReactions(): void {
+  if (!config.reactionsEnabled || authMode() !== "user-oauth") throw new Error("Reactions require explicit enablement and user-oauth authentication");
+}
+function validateConfig(): void {
+  for (const value of [config.projectId, config.topicId, config.subscriptionId]) {
+    if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.~+%-]{0,254}$/.test(value) || value.includes("%")) throw new Error("Invalid project/topic/subscription identifier");
   }
-
-  const sa = JSON.parse(readFileSync(serviceAccountFile, "utf-8"));
-  const iat = Math.floor(now);
-  const exp = iat + 3600;
-
-  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
-  const payload = Buffer.from(
-    JSON.stringify({
-      iss: sa.client_email,
-      scope:
-        "https://www.googleapis.com/auth/chat.bot https://www.googleapis.com/auth/chat.messages.reactions",
-      aud: "https://oauth2.googleapis.com/token",
-      iat,
-      exp,
-    })
-  ).toString("base64url");
-
-  const signer = createSign("RSA-SHA256");
-  signer.update(`${header}.${payload}`);
-  const signature = signer.sign(sa.private_key, "base64url");
-  const jwt = `${header}.${payload}.${signature}`;
-
-  const result = await httpForm("https://oauth2.googleapis.com/token", {
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    assertion: jwt,
-  });
-
-  botCache.token = result.access_token;
-  botCache.expiresAt = now + 3000;
-  logger.info("Bot SA token minted (valid ~50 min)");
-  return result.access_token;
+  if (!Array.isArray(config.bindings) || !config.bindings.length) throw new Error("At least one binding is required");
+  const spaces = new Set<string>();
+  for (const binding of config.bindings) {
+    if (!SPACE_RE.test(binding.space) || spaces.has(binding.space)) throw new Error("Invalid or duplicate space binding");
+    spaces.add(binding.space);
+    if (!Array.isArray(binding.agents) || !binding.agents.length || binding.agents.length > 10 || new Set(binding.agents.map(a => a.agentId)).size !== binding.agents.length || binding.agents.some(a => !/^[a-zA-Z0-9_-]{1,80}$/.test(a.agentId))) throw new Error("Invalid agent binding");
+    for (const list of [binding.allowFrom, binding.commandAllowFrom]) {
+      if (list !== undefined && (!Array.isArray(list) || list.some(v => !USER_RE.test(v)))) throw new Error("Allowlists require stable numeric users/<id> identifiers");
+    }
+    if (!(binding.allowAllSpaceMembers ?? config.allowAllSpaceMembers) && !(binding.allowFrom ?? config.allowFrom)?.length) throw new Error("Configure allowFrom or explicitly allowAllSpaceMembers for every space");
+  }
+  if (config.media?.localRoots !== undefined && (!Array.isArray(config.media.localRoots)
+    || config.media.localRoots.some(root => typeof root !== "string" || !isAbsolute(root)))) throw new Error("Media roots must be absolute paths");
+  for (const list of [config.allowFrom, config.commandAllowFrom]) {
+    if (list !== undefined && (!Array.isArray(list) || list.some(v => !USER_RE.test(v)))) throw new Error("Allowlists require stable numeric users/<id> identifiers");
+  }
+  if (config.auth && !["service-account", "user-oauth"].includes(config.auth.mode)) throw new Error("Invalid authentication mode");
+  if (authMode() === "user-oauth" && (!config.oauth?.clientId || !config.oauth.clientSecret || !config.oauth.tokensFile)) throw new Error("User OAuth configuration is incomplete");
+  if (authMode() === "service-account" && (config.reactionsEnabled || config.media?.outboundEnabled)) throw new Error("App authentication does not support user-only reactions/uploads");
+  for (const [value, min, max] of [
+    [config.pollIntervalSeconds ?? 3, 1, 300], [config.agentTimeoutSeconds ?? 60, 10, 3600],
+    [config.maxPendingMessages ?? 200, 1, 1000], [config.renewalBufferMinutes ?? 30, 1, 60],
+    [mediaLimit(), 1, 200 * 1024 * 1024], [config.media?.maxAttachments ?? 5, 1, 10],
+    [config.media?.retentionHours ?? 24, 1, 168],
+  ]) { if (!Number.isInteger(value) || value < min || value > max) throw new Error("Invalid numeric limit in plugin configuration"); }
 }
 
 // ── Routing ──────────────────────────────────────────────────────────────────
@@ -494,7 +484,7 @@ function buildRoutingTable(
     let pattern: RegExp | null = null;
     if (keywords.length) {
       pattern = new RegExp(
-        `(?:^|[\\s@<])(${keywords.join("|")})(?:[\\s>,.:!?'")}]|$)`,
+        `(?:^|[\\s@<])(${keywords.join("|")})(?=[\\s>,.:!?'")}]|$)`,
         "i"
       );
     }
@@ -549,173 +539,51 @@ function routeMessage(text: string, space: string): AgentBinding[] {
 
 async function pullMessages(token: string): Promise<any[]> {
   const sub = `projects/${config.projectId}/subscriptions/${config.subscriptionId}`;
-  const { data } = await httpJson(
-    `https://pubsub.googleapis.com/v1/${sub}:pull`,
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body: { maxMessages: 10, returnImmediately: true },
-    }
-  );
-  return data.receivedMessages || [];
+  const { status, data } = await httpJson(`https://pubsub.googleapis.com/v1/${sub}:pull`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}` }, body: { maxMessages: 10, returnImmediately: true },
+  });
+  if (status >= 400 || !data) throw new ApiError("Pub/Sub pull", status);
+  return Array.isArray(data.receivedMessages) ? data.receivedMessages : [];
 }
-
 async function ackMessages(token: string, ackIds: string[]): Promise<void> {
   if (!ackIds.length) return;
   const sub = `projects/${config.projectId}/subscriptions/${config.subscriptionId}`;
-  await httpJson(`https://pubsub.googleapis.com/v1/${sub}:acknowledge`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: { ackIds },
+  const { status } = await httpJson(`https://pubsub.googleapis.com/v1/${sub}:acknowledge`, {
+    method: "POST", headers: { Authorization: `Bearer ${token}` }, body: { ackIds },
   });
+  if (status >= 400) throw new ApiError("Pub/Sub acknowledgement", status);
 }
-
-// ── Workspace Events subscriptions ──────────────────────────────────────────
 
 function resolveStateDir(): string {
-  return pluginApi?.runtime?.state?.resolveStateDir?.() || resolve(process.cwd(), '..');
+  const state = pluginApi?.runtime?.state?.resolveStateDir?.();
+  if (!state) throw new Error("OpenClaw runtime state directory is unavailable");
+  return state;
 }
-
+function pluginStateDir(): string { return join(resolveStateDir(), "googlechatpubsub"); }
 function loadSubState(): Record<string, any> {
-  const stateDir = resolveStateDir();
-  const fp = resolve(stateDir, STATE_FILE_NAME);
-  if (existsSync(fp)) {
-    try {
-      return JSON.parse(readFileSync(fp, "utf-8"));
-    } catch {}
-  }
-  return { subscriptions: {} };
+  const path = join(pluginStateDir(), STATE_FILE_NAME);
+  if (!existsSync(path)) return { subscriptions: {} };
+  const stat = lstatSync(path);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error("Unsafe subscription state file");
+  const data = JSON.parse(readFileSync(path, "utf8"));
+  if (!data || typeof data.subscriptions !== "object") throw new Error("Invalid subscription state");
+  return data;
 }
-
-function saveSubState(state: Record<string, any>): void {
-  const stateDir = resolveStateDir();
-  const fp = resolve(stateDir, STATE_FILE_NAME);
-  writeFileSync(fp, JSON.stringify(state, null, 2));
-}
-
-async function ensureSubscription(
-  space: string,
-  token: string
-): Promise<void> {
-  const topic = `projects/${config.projectId}/topics/${config.topicId}`;
-  const now = Date.now() / 1000;
-  const bufferSec = (config.renewalBufferMinutes ?? 30) * 60;
-
-  const existing = subscriptionState.subscriptions?.[space];
-  if (existing && existing.expiresAt > now + bufferSec) {
-    // State file says subscription is fresh — but verify it's actually alive
-    if (existing.name) {
-      try {
-        const { status: checkStatus, data: checkData } = await httpJson(
-          `https://workspaceevents.googleapis.com/v1/${existing.name}`,
-          { method: "GET", headers: { Authorization: `Bearer ${token}` } }
-        );
-        if (checkStatus < 400 && checkData?.state === "ACTIVE") {
-          // Actually alive — use real expiry from API if available
-          if (checkData.expireTime) {
-            const realExpiry = new Date(checkData.expireTime).getTime() / 1000;
-            if (realExpiry !== existing.expiresAt) {
-              existing.expiresAt = realExpiry;
-              saveSubState(subscriptionState);
-              logger.info(`Updated ${space} expiry from API: ${checkData.expireTime}`);
-            }
-          }
-          return;
-        }
-        logger.warn(
-          `Subscription for ${space} state=${checkData?.state ?? checkStatus} — recreating`
-        );
-      } catch (e: any) {
-        logger.warn(`Subscription verify failed for ${space}: ${e.message} — recreating`);
-      }
-    }
-  }
-
-  logger.info(
-    `Creating/renewing Workspace Events subscription for ${space}`
-  );
-
-  const body = {
-    targetResource: `//chat.googleapis.com/${space}`,
-    eventTypes: ["google.workspace.chat.message.v1.created"],
-    notificationEndpoint: { pubsubTopic: topic },
-    payloadOptions: { includeResource: true },
-  };
-
-  const { status, data } = await httpJson(
-    "https://workspaceevents.googleapis.com/v1/subscriptions",
-    {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
-      body,
-    }
-  );
-
-  if (status === 409) {
-    logger.info(`Subscription already exists for ${space} — fetching real expiry`);
-    // List subscriptions to find the real name and expiry
-    try {
-      const filter = encodeURIComponent(`target_resource="//chat.googleapis.com/${space}"`);
-      const { status: listSt, data: listData } = await httpJson(
-        `https://workspaceevents.googleapis.com/v1/subscriptions?filter=${filter}`,
-        { method: "GET", headers: { Authorization: `Bearer ${token}` } }
-      );
-      const sub = listData?.subscriptions?.[0];
-      if (sub) {
-        const realExpiry = sub.expireTime
-          ? new Date(sub.expireTime).getTime() / 1000
-          : now + SUBSCRIPTION_TTL;
-        subscriptionState.subscriptions ??= {};
-        subscriptionState.subscriptions[space] = {
-          space,
-          name: sub.name,
-          expiresAt: realExpiry,
-        };
-        saveSubState(subscriptionState);
-        logger.info(`Found existing subscription ${sub.name} (expires ${sub.expireTime || "~4h"})`);
-        return;
-      }
-    } catch (e: any) {
-      logger.warn(`Failed to list subscriptions for ${space}: ${e.message}`);
-    }
-    // Fallback: use estimated TTL
-    subscriptionState.subscriptions ??= {};
-    subscriptionState.subscriptions[space] = {
-      space,
-      expiresAt: now + SUBSCRIPTION_TTL,
-    };
-    saveSubState(subscriptionState);
-    return;
-  }
-
-  if (status >= 400) {
-    logger.error(
-      `Failed to create subscription for ${space}: ${status} ${JSON.stringify(data).slice(0, 300)}`
-    );
-    return;
-  }
-
+function saveSubState(state: Record<string, any>): void { atomicJson(join(pluginStateDir(), STATE_FILE_NAME), state); }
+async function ensureSubscription(space: string, token: string): Promise<void> {
+  const entry = await maintainSubscription({
+    space, topic: `projects/${config.projectId}/topics/${config.topicId}`,
+    current: subscriptionState.subscriptions?.[space], token,
+    inspectionToken: authMode() === "service-account" ? await getBotToken() : token,
+    bufferSeconds: (config.renewalBufferMinutes ?? 30) * 60, request: httpJson,
+  });
   subscriptionState.subscriptions ??= {};
-  subscriptionState.subscriptions[space] = {
-    space,
-    name: data.name,
-    expiresAt: now + SUBSCRIPTION_TTL,
-  };
+  subscriptionState.subscriptions[space] = entry;
   saveSubState(subscriptionState);
-  logger.info(
-    `Workspace Events subscription created for ${space} (expires in ~4h)`
-  );
 }
-
 async function checkAndRenewAll(): Promise<void> {
-  const token = await getOAuthToken();
-  for (const space of targetSpaces) {
-    try {
-      await ensureSubscription(space, token);
-    } catch (e: any) {
-      logger.error(`Subscription check failed for ${space}: ${e.message}`);
-    }
-  }
+  const token = await getEventsToken();
+  for (const space of targetSpaces) await ensureSubscription(space, token);
 }
 
 // ── Attachment downloader ────────────────────────────────────────────────────
@@ -730,90 +598,40 @@ interface DownloadedAttachment {
  * Download Google Chat attachments via the Chat API media.download endpoint.
  * Files are saved to ~/.openclaw/media/inbound/ so OpenClaw picks them up as MediaUrls.
  */
-async function downloadAttachments(
-  attachments: any[],
-  oauthToken: string
-): Promise<DownloadedAttachment[]> {
-  if (!attachments || attachments.length === 0) return [];
+function pruneInboundMedia(): void {
+  const mediaDir = join(resolveStateDir(), "media", "inbound", "googlechatpubsub");
+  if (!existsSync(mediaDir)) return;
+  const directory = lstatSync(mediaDir);
+  if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error("Unsafe media directory");
+  const cutoff = Date.now() - (config.media?.retentionHours ?? 24) * 3600_000;
+  for (const name of readdirSync(mediaDir)) {
+    if (!/^[0-9a-f-]{36}\.[A-Za-z0-9]{1,10}$/.test(name)) continue;
+    const path = join(mediaDir, name);
+    const st = lstatSync(path);
+    if (st.isFile() && !st.isSymbolicLink() && st.mtimeMs < cutoff) unlinkSync(path);
+  }
+}
 
-  const stateDir = resolveStateDir();
-  const mediaDir = join(stateDir, "media", "inbound");
-  try {
-    mkdirSync(mediaDir, { recursive: true });
-  } catch {}
-
+async function downloadAttachments(attachments: any[], token: string): Promise<DownloadedAttachment[]> {
+  if (!config.media?.inboundEnabled || !attachments?.length) return [];
+  if (attachments.length > (config.media.maxAttachments ?? 5)) throw new Error("Too many inbound attachments");
+  const mediaDir = join(resolveStateDir(), "media", "inbound", "googlechatpubsub");
+  privateDirectory(mediaDir);
+  pruneInboundMedia();
   const results: DownloadedAttachment[] = [];
-
   for (const att of attachments) {
-    // media.download uses attachmentDataRef.resourceName (base64 resource token)
-    // att.name is for metadata GET only — returns 404 on media endpoint
-    const resourceName = att.attachmentDataRef?.resourceName as string | undefined;
-    const attachmentPath = resourceName || (att.name as string | undefined);
-    if (!attachmentPath) {
-      logger.warn(`[attachment] No resourceName or att.name — skipping: ${JSON.stringify(att).slice(0, 200)}`);
-      continue;
-    }
-
-    const mimeType: string = att.contentType || "application/octet-stream";
-    // att.contentName is the original filename (e.g. "photo.jpg")
-    const originalName: string = att.contentName || attachmentPath.split("/").pop() || "attachment";
-
-    // Derive extension from original filename or mimeType
-    let ext = extname(originalName);
-    if (!ext) {
-      const mimeToExt: Record<string, string> = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/gif": ".gif",
-        "image/webp": ".webp",
-        "application/pdf": ".pdf",
-        "text/plain": ".txt",
-        "text/csv": ".csv",
-        "application/zip": ".zip",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
-      };
-      ext = mimeToExt[mimeType] || ".bin";
-    }
-
+    const resource = att.attachmentDataRef?.resourceName || att.name;
+    if (typeof resource !== "string" || !/^[A-Za-z0-9_./=+-]+$/.test(resource)
+      || resource.split("/").some((part: string) => part === "." || part === "..")) continue;
+    let ext = extname(typeof att.contentName === "string" ? att.contentName : "");
+    if (!/^\.[A-Za-z0-9]{1,10}$/.test(ext)) ext = ".bin";
     const filename = `${randomUUID()}${ext}`;
     const localPath = join(mediaDir, filename);
-
-    try {
-      // Chat API media download: GET /v1/media/{resourceName}?alt=media
-      // resourceName from attachmentDataRef is the correct token for media download
-      const downloadUrl = `https://chat.googleapis.com/v1/media/${attachmentPath}?alt=media`;
-      logger.info(`[attachment] Downloading ${attachmentPath} → ${filename}`);
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 30_000);
-      let resp: Response;
-      try {
-        resp = await fetch(downloadUrl, {
-          method: "GET",
-          headers: { Authorization: `Bearer ${oauthToken}` },
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-
-      if (!resp.ok) {
-        const errText = await resp.text().catch(() => "");
-        logger.warn(`[attachment] Download failed (${resp.status}): ${errText.slice(0, 200)}`);
-        continue;
-      }
-
-      const buffer = Buffer.from(await resp.arrayBuffer());
-      const { writeFileSync: wfs } = await import("node:fs");
-      wfs(localPath, buffer);
-      logger.info(`[attachment] Saved ${buffer.length} bytes → ${localPath}`);
-      results.push({ localPath, mimeType, filename });
-    } catch (err: any) {
-      logger.error(`[attachment] Download error for ${attachmentPath}: ${err.message}`);
-    }
+    const url = `https://chat.googleapis.com/v1/media/${resource.split("/").map(encodeURIComponent).join("/")}?alt=media`;
+    const downloaded = await fetchMedia(url, mediaLimit(), { Authorization: `Bearer ${token}` });
+    writeFileSync(localPath, downloaded.buffer, { flag: "wx", mode: 0o600 });
+    results.push({ localPath, filename, mimeType: downloaded.headers.get("content-type") || "application/octet-stream" });
   }
-
   return results;
 }
 
@@ -863,54 +681,33 @@ interface ResolvedMedia {
  * Resolve one outbound media reference (local path, file:// URL, or http(s) URL)
  * into an in-memory buffer plus filename/MIME metadata.
  */
-async function resolveOutboundMedia(
-  ref: string,
-  opts: { readFile?: (p: string) => Promise<Buffer> } = {}
-): Promise<ResolvedMedia> {
+async function resolveOutboundMedia(ref: string, opts: { readFile?: (p: string) => Promise<Buffer> } = {}): Promise<ResolvedMedia> {
+  requireOutboundMedia();
   const trimmed = String(ref || "").trim();
   if (!trimmed) throw new Error("Empty media reference");
-
   if (/^https?:\/\//i.test(trimmed)) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 60_000);
-    let resp: Response;
-    try {
-      resp = await fetch(trimmed, { signal: controller.signal });
-    } finally {
-      clearTimeout(timer);
-    }
-    if (!resp.ok) {
-      throw new Error(`Fetch media failed (${resp.status}) for ${trimmed}`);
-    }
-    const buffer = Buffer.from(await resp.arrayBuffer());
+    if (!config.media?.allowRemoteUrls) throw new Error("Remote media URLs are disabled");
+    const result = await fetchMedia(trimmed, mediaLimit());
     let filename = "";
-    const disposition = resp.headers.get("content-disposition") || "";
+    const disposition = result.headers.get("content-disposition") || "";
     const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
-    if (match) filename = decodeURIComponent(match[1]);
-    if (!filename) {
-      try {
-        filename = decodeURIComponent(new URL(trimmed).pathname.split("/").pop() || "");
-      } catch {}
-    }
-    if (!filename) filename = "attachment";
-    const headerMime = (resp.headers.get("content-type") || "").split(";")[0].trim();
-    const mimeType = headerMime || guessMimeType(filename);
+    if (match) { try { filename = decodeURIComponent(match[1]); } catch {} }
+    if (!filename) { try { filename = decodeURIComponent(new URL(result.url).pathname.split("/").pop() || ""); } catch {} }
+    filename = filename.replace(/[\\/\r\n\x00]/g, "_").slice(0, 200) || "attachment";
+    const headerMime = (result.headers.get("content-type") || "").split(";")[0].trim();
+    const mimeType = /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(headerMime) ? headerMime : guessMimeType(filename);
     if (!extname(filename)) {
-      const ext = Object.entries(EXT_TO_MIME).find(([, m]) => m === mimeType)?.[0];
+      const ext = Object.entries(EXT_TO_MIME).find(([, mime]) => mime === mimeType)?.[0];
       if (ext) filename += ext;
     }
-    return { buffer, filename, mimeType };
+    return { buffer: result.buffer, filename, mimeType };
   }
-
-  const localPath = trimmed.startsWith("file://")
-    ? decodeURIComponent(new URL(trimmed).pathname)
-    : resolve(trimmed);
-
-  const buffer = opts.readFile
-    ? await opts.readFile(localPath)
-    : readFileSync(localPath);
-  const filename = localPath.split("/").pop() || "attachment";
-  return { buffer, filename, mimeType: guessMimeType(filename) };
+  const localPath = trimmed.startsWith("file://") ? fileURLToPath(trimmed) : resolve(trimmed);
+  // A host-supplied reader is an existing authorization capability. Otherwise require explicit roots.
+  const buffer = opts.readFile ? await opts.readFile(localPath)
+    : await readMediaFile(localPath, config.media?.localRoots ?? [], mediaLimit());
+  if (buffer.length > mediaLimit()) throw new Error("Media exceeds configured byte limit");
+  return { buffer, filename: localPath.split("/").pop() || "attachment", mimeType: guessMimeType(localPath) };
 }
 
 /**
@@ -927,6 +724,10 @@ async function uploadAttachment(params: {
   timeoutMs?: number;
 }): Promise<string> {
   const { space, media, token, timeoutMs = 120_000 } = params;
+  requireOutboundMedia();
+  assertDestination(space);
+  if (media.buffer.length > mediaLimit()) throw new Error("Media exceeds configured byte limit");
+  if (!/^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+$/.test(media.mimeType)) throw new Error("Invalid media content type");
 
   if (media.buffer.length === 0) {
     throw new Error(`Refusing to upload empty file: ${media.filename}`);
@@ -953,6 +754,7 @@ async function uploadAttachment(params: {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let resp: Response;
+  let text: string;
   try {
     resp = await fetch(url, {
       method: "POST",
@@ -962,27 +764,27 @@ async function uploadAttachment(params: {
       },
       body,
       signal: controller.signal,
+      redirect: "error",
     });
+    text = (await readBoundedResponse(resp, 64 * 1024)).toString("utf8");
   } finally {
     clearTimeout(timer);
   }
-
-  const text = await resp.text();
   if (!resp.ok) {
-    throw new Error(`Attachment upload failed (${resp.status}): ${text.slice(0, 300)}`);
+    throw new Error(`Attachment upload failed (${resp.status}): request rejected`);
   }
   let data: any;
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(`Attachment upload returned non-JSON: ${text.slice(0, 200)}`);
+    throw new Error(`Attachment upload returned non-JSON: invalid response`);
   }
   const uploadToken = data?.attachmentDataRef?.attachmentUploadToken;
   if (!uploadToken) {
-    throw new Error(`Attachment upload missing attachmentUploadToken: ${text.slice(0, 200)}`);
+    throw new Error(`Attachment upload missing attachmentUploadToken: invalid response`);
   }
   logger.info(
-    `[upload] ${media.filename} (${media.mimeType}, ${media.buffer.length} bytes) → token acquired`
+    `[upload] Uploaded ${media.buffer.length} bytes`
   );
   return uploadToken;
 }
@@ -1016,6 +818,9 @@ async function sendMediaMessages(params: {
     readFile,
   } = params;
 
+  requireOutboundMedia();
+  assertDestination(space, threadName);
+  if (mediaRefs.length > (config.media?.maxAttachments ?? 5)) throw new Error("Too many outbound attachments");
   const failed: string[] = [];
   const messageIds: string[] = [];
   let sent = 0;
@@ -1045,9 +850,10 @@ async function sendMediaMessages(params: {
         timeoutMs: 60_000,
       });
       if (status >= 400) {
-        throw new Error(`Message create failed (${status}): ${JSON.stringify(data).slice(0, 300)}`);
+        throw new Error(`Message create failed (${status}): request rejected`);
       }
       captionPending = "";
+      assertChatMessage(data, space);
       sent++;
       if (data?.name) messageIds.push(data.name);
       // This message was posted with the USER OAuth credential, so Google will
@@ -1055,10 +861,10 @@ async function sendMediaMessages(params: {
       // happen so the echo is dropped even if selfUserId is not resolved yet.
       markProcessed(data?.name);
       rememberSelfIdentity(data);
-      logger.info(`[upload] Sent attachment ${media.filename} → ${space}`);
+      logger.info(`[upload] Sent attachment to ${space}`);
     } catch (err: any) {
-      logger.error(`[upload] Failed for ${ref}: ${err.message}`);
-      failed.push(`${ref}: ${err.message}`);
+      logger.error(`[upload] Failed: ${safeError(err)}`);
+      failed.push(`Attachment delivery failed: ${safeError(err)}`);
     }
   }
 
@@ -1076,7 +882,9 @@ async function sendMediaMessages(params: {
       headers: { Authorization: `Bearer ${token}` },
       body: msgBody,
     })
-      .then(({ data }) => {
+      .then(({ status, data }) => {
+        if (status >= 400) return;
+        assertChatMessage(data, space);
         // Also user-auth'd, so it echoes back typed HUMAN like the uploads.
         markProcessed(data?.name);
         rememberSelfIdentity(data);
@@ -1103,6 +911,7 @@ async function processMessageInPipeline(params: {
   threadSessionIsolation: boolean;
   attachmentPaths?: string[];
   crossDispatchChainKey?: string;
+  rawAttachments?: any[];
 }): Promise<void> {
   const {
     agentId,
@@ -1125,6 +934,7 @@ async function processMessageInPipeline(params: {
   // Collect all delivered text for cross-dispatch scanning
   const deliveredChunks: string[] = [];
 
+  assertDestination(space, threadName || undefined);
   const api = pluginApi;
   const cfg = api.config;
   const runtime = api.runtime;
@@ -1185,9 +995,9 @@ async function processMessageInPipeline(params: {
     SenderName: senderName || undefined,
     SenderId: senderId,
     WasMentioned: false,
-    CommandAuthorized: true,
+    CommandAuthorized: isCommandAuthorized(space, senderId),
     Provider: "googlechatpubsub",
-    Surface: "googlechat",
+    Surface: "googlechatpubsub",
     MessageSid: messageName,
     MessageSidFull: messageName,
     ReplyToId: threadName || undefined,
@@ -1210,7 +1020,7 @@ async function processMessageInPipeline(params: {
     })
     .catch((err: any) => {
       logger.error(
-        `googlechatpubsub: failed updating session meta: ${String(err)}`
+        `googlechatpubsub: failed updating session meta: ${safeError(err)}`
       );
     });
 
@@ -1272,10 +1082,10 @@ async function processMessageInPipeline(params: {
           replyThreadName = result.data.thread.name;
         }
       } else {
-        logger.warn(`Typing indicator failed: ${result.status} ${JSON.stringify(result.data).slice(0, 200)}`);
+        logger.warn(`Typing indicator failed: ${result.status} request rejected`);
       }
     } catch (err: any) {
-      logger.warn(`Typing indicator exception: ${err.message}`);
+      logger.warn(`Typing indicator exception: ${safeError(err)}`);
     }
   } else {
     logger.info(`🔇 silentReply=true — skipping typing indicator`);
@@ -1289,6 +1099,7 @@ async function processMessageInPipeline(params: {
     accountId: agentId,
   });
 
+  let pipelineError: Error | undefined;
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: ctxPayload,
     cfg,
@@ -1300,7 +1111,9 @@ async function processMessageInPipeline(params: {
         mediaUrl?: string;
         replyToId?: string;
       }, info?: any) => {
-        logger.info(`📤 deliver called! kind=${info?.kind || '?'} text=${(payload.text || '').slice(0, 100)} mediaUrls=${payload.mediaUrls?.length || 0}`);
+        logger.debug(`Reply delivery: kind=${info?.kind || "unknown"}`);
+        if (activeAbort?.signal.aborted) throw new Error("Reply cancelled");
+        assertDestination(space, threadName || undefined);
         const botToken = await getBotToken();
         const replyText = payload.text?.trim();
 
@@ -1312,6 +1125,7 @@ async function processMessageInPipeline(params: {
         const uniqueMediaRefs = [...new Set(mediaRefs)];
 
         if (uniqueMediaRefs.length > 0) {
+          requireOutboundMedia();
           // Media path: attachments carry the text as the first message's caption.
           const effectiveThread = replyInThread ? replyThreadName : threadName;
 
@@ -1334,6 +1148,7 @@ async function processMessageInPipeline(params: {
             threadName: effectiveThread,
             replyMessageOption,
           });
+          if (result.failed.length) throw new Error("One or more media deliveries failed");
           logger.info(
             `📎 Media delivery: ${result.sent}/${uniqueMediaRefs.length} sent` +
               (result.failed.length ? ` | failures: ${result.failed.join("; ").slice(0, 300)}` : "")
@@ -1380,7 +1195,7 @@ async function processMessageInPipeline(params: {
                 }
               );
               if (patchResult.status >= 400) {
-                logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: ${JSON.stringify(patchResult.data).slice(0, 200)}`);
+                logger.warn(`PATCH failed (${patchResult.status}), falling back to POST: request rejected`);
                 // Fallback: send as new message
                 const msgBody: any = { text: chunk };
                 let url = `https://chat.googleapis.com/v1/${space}/messages`;
@@ -1394,8 +1209,11 @@ async function processMessageInPipeline(params: {
                   headers: { Authorization: `Bearer ${botToken}` },
                   body: msgBody,
                 });
+                if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
+                assertChatMessage(postResult.data, space);
                 logger.info(`POST fallback result: ${postResult.status}`);
               } else {
+                assertChatMessage(patchResult.data, space);
                 logger.info(`✅ PATCH succeeded`);
               }
               typingMessageName = undefined;
@@ -1412,22 +1230,27 @@ async function processMessageInPipeline(params: {
                 headers: { Authorization: `Bearer ${botToken}` },
                 body: msgBody,
               });
+              if (postResult.status >= 400) throw new ApiError("Chat reply", postResult.status);
+                assertChatMessage(postResult.data, space);
               logger.info(`📨 POST result: ${postResult.status}`);
             }
           } catch (err: any) {
-            logger.error(`Chat API reply failed: ${err.message}`);
+            logger.error(`Chat API reply failed: ${safeError(err)}`);
+            pipelineError = new Error("Chat API reply failed");
+            throw pipelineError;
           }
         }
       },
       onSkip: (payload: any, info: any) => {
-        logger.warn(`⏭️ Reply skipped: kind=${info?.kind} reason=${info?.reason} text=${(payload?.text || '').slice(0, 100)}`);
+        logger.debug(`Reply skipped: kind=${info?.kind || "unknown"}`);
       },
       onHeartbeatStrip: () => {
         logger.info(`💓 Heartbeat strip triggered`);
       },
       onError: (err: any, info: any) => {
+        pipelineError = new Error("Agent or reply delivery failed");
         logger.error(
-          `googlechatpubsub reply ${info?.kind || "?"} failed: ${String(err)}`
+          `googlechatpubsub reply ${info?.kind || "?"} failed: ${safeError(err)}`
         );
         // Clean up typing indicator on error
         if (typingMessageName) {
@@ -1447,6 +1270,8 @@ async function processMessageInPipeline(params: {
     },
     replyOptions: {
       onModelSelected,
+      abortSignal: activeAbort?.signal,
+      onAgentRunTerminalOutcome: (outcome: string) => { if (outcome === "failed") pipelineError = new Error("Agent run failed"); },
     },
   });
 
@@ -1463,9 +1288,11 @@ async function processMessageInPipeline(params: {
       });
       logger.info(`✅ Orphaned typing message deleted`);
     } catch (err: any) {
-      logger.error(`Failed to delete orphaned typing message: ${err.message}`);
+      logger.error(`Failed to delete orphaned typing message: ${safeError(err)}`);
     }
   }
+
+  if (pipelineError) throw pipelineError;
 
   // 7) Cross-agent dispatch: scan delivered text for mentions of other agents
   //    Only runs when config.crossAgentDispatch === true
@@ -1485,191 +1312,127 @@ async function processMessageInPipeline(params: {
         chainKey,
       });
     } catch (err: any) {
-      logger.error(`Cross-agent dispatch error: ${err.message}`);
+      logger.error(`Cross-agent dispatch error: ${safeError(err)}`);
+      throw err;
     }
   }
 }
 
 // ── Chat API reaction ───────────────────────────────────────────────────────
 
-async function sendReaction(
-  oauthToken: string,
-  messageName: string,
-  emoji: string = "⏳"
-): Promise<string | undefined> {
-  const url = `https://chat.googleapis.com/v1/${messageName}/reactions`;
-  const { status, data } = await httpJson(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${oauthToken}` },
-    body: { emoji: { unicode: emoji } },
-  });
-
-  if (status >= 400) {
-    logger.warn(
-      `Reaction failed (${status}): ${JSON.stringify(data).slice(0, 300)}`
-    );
-    return undefined;
-  } else {
-    logger.info(`⏳ Reacted to ${messageName} (reaction: ${data?.name})`);
-    return data?.name as string | undefined;
-  }
-}
-
 // ── Poll loop ───────────────────────────────────────────────────────────────
 
-async function pollOnce(): Promise<void> {
-  try {
-    // Periodic renewal
-    if (Date.now() - lastRenewalCheck > RENEWAL_INTERVAL) {
-      await checkAndRenewAll();
-      lastRenewalCheck = Date.now();
-    }
+function admittedJobs(received: any): QueuedMessage[] {
+  if (received.message?.attributes?.["ce-type"] !== MESSAGE_EVENT) return [];
+  const raw = received.message?.data;
+  if (typeof raw !== "string" || raw.length > 90_000) return [];
+  let data: any;
+  try { data = JSON.parse(Buffer.from(raw, "base64").toString("utf8")); } catch { return []; }
+  const message = data.message;
+  if (!message || message.sender?.type !== "HUMAN" || isSelfMessage(message.sender)) return [];
+  const space = message.space?.name;
+  const sender = message.sender?.name;
+  if (typeof space !== "string" || typeof sender !== "string" || !isSenderAllowed(space, sender)) return [];
+  const messageName = message.name;
+  if (typeof messageName !== "string" || !messageName) return [];
+  const threadName = message.thread?.name || "";
+  try { assertResource(space, messageName, "messages"); assertResource(space, threadName || undefined, "threads"); } catch { return []; }
+  if (processedMsgIds.has(messageName)) return [];
+  const text = typeof message.text === "string" ? message.text.trim() : "";
+  if (Buffer.byteLength(text) > 32 * 1024) return [];
+  const rawAttachments = config.media?.inboundEnabled ? (message.attachment || message.attachments || []) : [];
+  if (!Array.isArray(rawAttachments) || rawAttachments.length > (config.media?.maxAttachments ?? 5)) return [];
+  const attachments = rawAttachments.map((att: any) => ({
+    name: typeof att?.name === "string" ? att.name.slice(0, 2048) : undefined,
+    contentName: typeof att?.contentName === "string" ? att.contentName.slice(0, 200) : undefined,
+    attachmentDataRef: { resourceName: typeof att?.attachmentDataRef?.resourceName === "string" ? att.attachmentDataRef.resourceName.slice(0, 2048) : undefined },
+  }));
+  if (!text && !attachments.length) return [];
+  const entry = routingTable.get(space)!;
+  return (text ? routeMessage(text, space) : entry.alwaysListen).map(agent => ({
+    agent, space, spaceDisplayName: space, senderId: sender,
+    senderName: typeof message.sender.displayName === "string" ? message.sender.displayName.slice(0, 200) : sender,
+    text, messageName, threadName, eventTime: message.createTime || new Date().toISOString(),
+    replyInThread: entry.replyInThread, threadSessionIsolation: entry.threadSessionIsolation,
+    attachmentPaths: [], rawAttachments: attachments,
+  }));
+}
 
-    const oauthToken = await getOAuthToken();
-
-    const messages = await pullMessages(oauthToken);
-    if (!messages.length) return;
-
-    logger.info(`Pulled ${messages.length} message(s)`);
-
-    // Ack immediately to prevent redelivery
-    await ackMessages(
-      oauthToken,
-      messages.map((m: any) => m.ackId)
-    );
-
-    for (const msg of messages) {
-      const raw = msg.message?.data;
-      if (!raw) continue;
-
-      let data: any;
+function startInboxWorker(): void {
+  if (workerPromise || stopping || !inbox || fatalInboxError) return;
+  workerPromise = (async () => {
+    while (!stopping && !fatalInboxError) {
+      const record = inbox!.ready();
+      if (!record?.payload) return;
+      const msg = record.payload;
+      let dispatched = false;
+      const attempts = record.attempts + 1;
       try {
-        data = JSON.parse(Buffer.from(raw, "base64").toString());
-      } catch {
-        continue;
-      }
-
-      const chatMsg = data.message;
-      if (!chatMsg) continue;
-
-      // Dedup
-      const msgName = chatMsg.name || "";
-      if (msgName && processedMsgIds.has(msgName)) continue;
-
-      const sender = chatMsg.sender || {};
-      if (sender.type !== "HUMAN") continue;
-
-      // Messages this plugin posted via the user OAuth credential (every
-      // attachment upload) come back typed HUMAN. Without this guard they are
-      // re-ingested as inbound and trigger a fresh agent run — a self-echo loop.
-      if (isSelfMessage(sender)) {
-        markProcessed(msgName);
-        continue;
-      }
-
-      const space = chatMsg.space?.name || "";
-      if (!targetSpaces.has(space)) continue;
-
-      const text = (chatMsg.text || "").trim();
-      // Google Chat Pub/Sub uses "attachment" (singular array), not "attachments"
-      const rawAttachments: any[] = chatMsg.attachment || chatMsg.attachments || [];
-      // Require either text or attachments — skip empty messages
-      if (!text && rawAttachments.length === 0) continue;
-
-      const displayName = sender.displayName || sender.name || "?";
-      logger.info(`📩 [${space}] ${displayName}: ${text.slice(0, 120)}${rawAttachments.length ? ` [${rawAttachments.length} attachment(s)]` : ""}`);
-
-      // For attachment-only messages with no text, use alwaysListen agents only
-      const matched = text
-        ? routeMessage(text, space)
-        : (() => {
-            const entry = routingTable.get(space);
-            return entry ? [...entry.alwaysListen] : [];
-          })();
-
-      if (!matched.length) {
-        markProcessed(msgName);
-        continue;
-      }
-
-      // Get space-level threading config
-      const routingEntry = routingTable.get(space);
-      const spaceReplyInThread = routingEntry?.replyInThread ?? false;
-      const spaceThreadIsolation = routingEntry?.threadSessionIsolation ?? spaceReplyInThread;
-
-      // React with ⏳ to acknowledge receipt (stored so we can remove it after reply)
-      let pendingReactionName: string | undefined;
-      if (msgName) {
-        pendingReactionName = await sendReaction(oauthToken, msgName).catch(() => undefined);
-      }
-
-      // Download attachments (if any) before dispatching to agents
-      let downloadedPaths: string[] = [];
-      if (rawAttachments.length > 0) {
+        // Re-evaluate admission and routing after a restart/configuration change.
+        const current = config.bindings.find(b => b.space === msg.space);
+        if (!isSenderAllowed(msg.space, msg.senderId) || !current?.agents.some(a => a.agentId === msg.agent.agentId)) {
+          inbox!.update(record.id, { state: "done", reason: "admission revoked" });
+          continue;
+        }
+        inbox!.update(record.id, { attempts });
+        if (msg.rawAttachments?.length && config.media?.inboundEnabled) {
+          const token = authMode() === "service-account" ? await getBotToken() : await getOAuthToken();
+          msg.attachmentPaths = (await downloadAttachments(msg.rawAttachments, token)).map(item => item.localPath);
+        }
+        inbox!.update(record.id, { state: "running" });
+        dispatched = true;
+        const controller = new AbortController();
+        activeAbort = controller;
+        const timer = setTimeout(() => {
+          controller.abort();
+          logger.warn("Agent timeout: cancellation requested; waiting for the active run to settle");
+        }, (config.agentTimeoutSeconds ?? 60) * 1000);
         try {
-          // media.download requires OAuth token (service account JWT returns 403)
-          const downloaded = await downloadAttachments(rawAttachments, oauthToken);
-          downloadedPaths = downloaded.map((d) => d.localPath);
-          if (downloadedPaths.length > 0) {
-            logger.info(`📎 Downloaded ${downloadedPaths.length}/${rawAttachments.length} attachment(s)`);
-          }
-        } catch (err: any) {
-          logger.error(`Attachment download error: ${err.message}`);
+          await dispatchMessage(msg);
+          if (controller.signal.aborted) throw new Error("Agent run cancelled; inspect possible side effects");
+        } finally { clearTimeout(timer); activeAbort = undefined; }
+        inbox!.update(record.id, { state: "done" });
+        markProcessed(msg.messageName);
+      } catch (error) {
+        logger.error(`Inbox processing failed: ${safeError(error)}`);
+        try {
+          // Only pre-dispatch failures are safe to retry automatically.
+          inbox!.update(record.id, dispatched || attempts >= 3
+            ? { state: "failed", reason: dispatched ? "agent/delivery outcome uncertain; operator review required" : "pre-dispatch retries exhausted" }
+            : { state: "pending", nextAttempt: Date.now() + Math.min(60_000, 1000 * 2 ** attempts), reason: "pre-dispatch retry" });
+        } catch (storageError) {
+          fatalInboxError = true;
+          logger.error(`Inbox persistence failed; listener paused: ${safeError(storageError)}`);
         }
       }
-
-      // Dispatch to each matched agent (with queue support for busy sessions)
-      const dispatchPromises: Promise<void>[] = [];
-      for (const agent of matched) {
-        logger.info(
-          `🤖 [${agent.agentId}] Dispatching for ${space} (replyInThread=${spaceReplyInThread}, threadIsolation=${spaceThreadIsolation})`
-        );
-        dispatchPromises.push(
-          dispatchOrQueue({
-            agent,
-            space,
-            spaceDisplayName: chatMsg.space?.displayName || `space:${space}`,
-            senderId: sender.name || "",
-            senderName: displayName,
-            text,
-            messageName: msgName,
-            threadName: chatMsg.thread?.name || "",
-            eventTime: data.eventTime || chatMsg.createTime,
-            replyInThread: spaceReplyInThread,
-            threadSessionIsolation: spaceThreadIsolation,
-            attachmentPaths: downloadedPaths,
-          })
-        );
-      }
-      // Wait for all dispatches (some may return instantly if queued)
-      await Promise.all(dispatchPromises);
-
-      // Remove the ⏳ reaction now that the agent has finished replying
-      if (pendingReactionName) {
-        try {
-          const reactionToken = await getOAuthToken();
-          await httpJson(`https://chat.googleapis.com/v1/${pendingReactionName}`, {
-            method: "DELETE",
-            headers: { Authorization: `Bearer ${reactionToken}` },
-          });
-          logger.info(`🧹 Removed ⏳ reaction: ${pendingReactionName}`);
-        } catch (err: any) {
-          logger.warn(`Failed to remove ⏳ reaction: ${err.message}`);
-        }
-        pendingReactionName = undefined;
-      }
-
-      markProcessed(msgName);
     }
-  } catch (e: any) {
-    logger.error(`Poll error: ${e.message}`);
-    if (
-      e.message?.includes("401") ||
-      e.message?.includes("UNAUTHENTICATED")
-    ) {
-      oauthCache.expiresAt = 0;
+  })().catch(error => {
+    fatalInboxError = true;
+    logger.error(`Inbox worker stopped: ${safeError(error)}`);
+  }).finally(() => { workerPromise = undefined; });
+}
+
+async function pollOnce(): Promise<void> {
+  if (pollRunning || stopping || fatalInboxError) return;
+  pollRunning = true;
+  try {
+    if (Date.now() - lastRenewalCheck > RENEWAL_INTERVAL) {
+      lastRenewalCheck = Date.now();
+      try { pruneInboundMedia(); await checkAndRenewAll(); }
+      catch (error) { logger.error(`Subscription maintenance failed: ${safeError(error)}`); }
     }
-  }
+    const token = await getPubSubToken();
+    const received = await pullMessages(token);
+    for (const message of received) {
+      if (stopping) break;
+      if (typeof message.ackId !== "string" || !message.ackId) continue;
+      const jobs = admittedJobs(message);
+      // One atomic admission for every routed agent; a write/capacity failure prevents ACK.
+      inbox!.admit(jobs.map(payload => ({ id: `${payload.messageName}:${payload.agent.agentId}`, payload })));
+      await ackMessages(token, [message.ackId]);
+    }
+  } catch (error) { logger.error(`Pub/Sub poll failed: ${safeError(error)}`); }
+  finally { pollRunning = false; startInboxWorker(); }
 }
 
 // ── Plugin registration ─────────────────────────────────────────────────────
@@ -1720,6 +1483,18 @@ export default function register(api: any) {
     },
     handleAction: async (ctx: any) => {
       const { action, params } = ctx;
+      try {
+        if (action === "react" || action === "reactions") {
+          requireReactions();
+          const message = params.messageId || params.message_id || params.target;
+          const space = typeof message === "string" ? message.split("/").slice(0, 2).join("/") : "";
+          assertDestination(space);
+          assertResource(space, message, "messages");
+        } else if (action === "send" || action === "upload-file") {
+          assertDestination(params.target, params.threadId || params.replyTo);
+          if (action === "upload-file") requireOutboundMedia();
+        }
+      } catch { return { ok: false, error: "Action denied by channel policy" }; }
 
       if (action === "react") {
         const messageName = params.messageId || params.message_id || params.target;
@@ -1738,11 +1513,11 @@ export default function register(api: any) {
             },
           });
           if (status >= 400) {
-            return { ok: false, error: `Chat API react failed (${status}): ${JSON.stringify(data)}` };
+            return { ok: false, error: `Chat API react failed (${status}): request rejected` };
           }
           return { ok: true, added: emoji };
         } catch (e: any) {
-          return { ok: false, error: `React failed: ${e.message}` };
+          return { ok: false, error: `React failed: ${safeError(e)}` };
         }
       }
 
@@ -1758,9 +1533,10 @@ export default function register(api: any) {
             method: "GET",
             headers: { Authorization: `Bearer ${token}` },
           });
-          return { ok: true, reactions: data.reactions || [] };
+          if (status >= 400) return { ok: false, error: `Chat API reactions failed (${status})` };
+          return { ok: true, reactions: data?.reactions || [] };
         } catch (e: any) {
-          return { ok: false, error: `List reactions failed: ${e.message}` };
+          return { ok: false, error: `List reactions failed: ${safeError(e)}` };
         }
       }
 
@@ -1790,9 +1566,12 @@ export default function register(api: any) {
             headers: { Authorization: `Bearer ${token}` },
             body: msgBody,
           });
-          return { ok: status < 400, messageId: data?.name };
+          if (status >= 400) throw new ApiError("Chat send", status);
+          const messageId = assertChatMessage(data, space);
+          markProcessed(messageId);
+          return { ok: true, messageId };
         } catch (e: any) {
-          return { ok: false, error: `Send failed: ${e.message}` };
+          return { ok: false, error: `Send failed: ${safeError(e)}` };
         }
       }
 
@@ -1847,7 +1626,7 @@ export default function register(api: any) {
             ...(result.failed.length ? { partialFailures: result.failed } : {}),
           };
         } catch (e: any) {
-          return { ok: false, error: `Upload failed: ${e.message}` };
+          return { ok: false, error: `Upload failed: ${safeError(e)}` };
         }
       }
 
@@ -1857,9 +1636,10 @@ export default function register(api: any) {
       deliveryMode: "direct",
       sendText: async ({ text, target, threadId, replyTo }: any) => {
         try {
-          const token = await getBotToken();
           const space = target || config?.bindings?.[0]?.space;
           if (!space) return { ok: false };
+          assertDestination(space, threadId || replyTo);
+          const token = await getBotToken();
 
           const replyToThread = threadId || replyTo;
           const binding = config?.bindings?.find((b: any) => b.space === space);
@@ -1879,19 +1659,23 @@ export default function register(api: any) {
           });
           // Surface the platform message id so core does not suppress delivery
           // with `adapter_returned_no_identity`.
-          if (status < 400) markProcessed(data?.name);
-          return { ok: status < 400, messageId: data?.name, target: space };
+          if (status >= 400) throw new ApiError("Chat send", status);
+          const messageId = assertChatMessage(data, space);
+          markProcessed(messageId);
+          return { ok: true, messageId, target: space };
         } catch (e: any) {
-          logger.error(`outbound sendText error: ${e.message}`);
+          logger.error(`outbound sendText error: ${safeError(e)}`);
           return { ok: false };
         }
       },
       sendMedia: async ({ text, target, threadId, replyTo, mediaUrl, mediaReadFile }: any) => {
         try {
+          requireOutboundMedia();
           // attachments:upload requires user auth, not the bot service account.
-          const token = await getOAuthToken();
           const space = target || config?.bindings?.[0]?.space;
           if (!space) return { ok: false };
+          assertDestination(space, threadId || replyTo);
+          const token = await getOAuthToken();
           if (!mediaUrl) return { ok: false };
 
           const replyToThread = threadId || replyTo;
@@ -1918,7 +1702,7 @@ export default function register(api: any) {
             target: space,
           };
         } catch (e: any) {
-          logger.error(`outbound sendMedia error: ${e.message}`);
+          logger.error(`outbound sendMedia error: ${safeError(e)}`);
           return { ok: false };
         }
       },
@@ -1930,82 +1714,55 @@ export default function register(api: any) {
       id: "googlechatpubsub-listener",
 
       start: async () => {
-        try {
-        logger.info("[googlechatpubsub] start() called");
+        if (releaseInbox) throw new Error("Pub/Sub listener is already started");
         const cfg = api.config;
-        // Primary: channels.googlechatpubsub (standard channel convention)
-        // Fallback: plugins.entries.googlechatpubsub.config (legacy ≤0.1.x)
-        const pluginConfig: PubSubConfig =
-          cfg.channels?.googlechatpubsub ||
-          cfg.plugins?.entries?.googlechatpubsub?.config;
-
-        logger.info(`[googlechatpubsub] pluginConfig exists: ${!!pluginConfig}, enabled: ${pluginConfig?.enabled}`);
-
-        if (!pluginConfig?.enabled) {
-          logger.info("[googlechatpubsub] Disabled — skipping start");
-          return;
-        }
-
-        config = pluginConfig;
-
-        serviceAccountFile =
-          config.serviceAccountFile ||
-          cfg.channels?.googlechat?.serviceAccountFile ||
-          "";
-
-        if (!serviceAccountFile) {
-          logger.error("[googlechatpubsub] No serviceAccountFile configured");
-          return;
-        }
-
-        routingTable = buildRoutingTable(config.bindings);
-        targetSpaces = new Set(config.bindings.map((b) => b.space));
-        subscriptionState = loadSubState();
-        lastRenewalCheck = 0;
-
-        const pollMs = (config.pollIntervalSeconds ?? 3) * 1000;
-
-        logger.info("═".repeat(60));
-        logger.info("[googlechatpubsub] Starting listener (v3 — in-process pipeline)");
-        logger.info(`  Project     : ${config.projectId}`);
-        logger.info(`  Topic       : ${config.topicId}`);
-        logger.info(`  Subscription: ${config.subscriptionId}`);
-        logger.info(`  Poll        : ${pollMs}ms`);
-        for (const space of targetSpaces) {
-          const entry = routingTable.get(space)!;
-          const kws = [...entry.keywordAgents.keys()];
-          const als = entry.alwaysListen.map((a) => a.agentId);
-          logger.info(`  ├─ ${space}`);
-          logger.info(`  │  keywords: ${JSON.stringify(kws)}`);
-          logger.info(`  │  alwaysListen: ${JSON.stringify(als)}`);
-          logger.info(`  │  replyInThread: ${entry.replyInThread}`);
-          logger.info(`  │  threadSessionIsolation: ${entry.threadSessionIsolation}`);
-        }
-        logger.info("═".repeat(60));
-
-        // Initial token + subscription check
+        const selected: PubSubConfig = cfg.channels?.googlechatpubsub || cfg.plugins?.entries?.googlechatpubsub?.config;
+        if (!selected?.enabled) return;
+        config = selected;
+        serviceAccountFile = config.serviceAccountFile || cfg.channels?.googlechat?.serviceAccountFile || "";
+        if (!serviceAccountFile) throw new Error("serviceAccountFile is required");
+        const credentials = lstatSync(serviceAccountFile);
+        if (!credentials.isFile() || credentials.isSymbolicLink() || credentials.size > 64 * 1024) throw new Error("Unsafe service account file");
+        if (process.platform !== "win32" && (credentials.mode & 0o077)) throw new Error("Service account file must have mode 0600");
+        const key = JSON.parse(readFileSync(serviceAccountFile, "utf8"));
+        if (key.type !== "service_account" || !key.client_email || !key.private_key) throw new Error("Expected service_account credentials without user impersonation");
+        validateConfig();
+        privateDirectory(pluginStateDir());
+        releaseInbox = await lockInbox(join(pluginStateDir(), "inbox.json"));
         try {
-          await getOAuthToken();
-          await getBotToken();
-          await checkAndRenewAll();
+          authTokens = new ServiceAccountTokens(serviceAccountFile);
+          oauthCache = { token: null, expiresAt: 0 };
+          selfUserId = null; processedMsgIds.clear();
+          routingTable = buildRoutingTable(config.bindings);
+          targetSpaces = new Set(config.bindings.map(b => b.space));
+          subscriptionState = loadSubState();
+          inbox = new DurableInbox(join(pluginStateDir(), "inbox.json"), config.maxPendingMessages ?? 200);
+          fatalInboxError = false;
+          await getPubSubToken(); await getBotToken(); await checkAndRenewAll();
+          pruneInboundMedia();
           lastRenewalCheck = Date.now();
-        } catch (e: any) {
-          logger.error(`[googlechatpubsub] Init failed: ${e.message}`);
-        }
-
-        pollTimer = setInterval(() => pollOnce(), pollMs);
-        logger.info("[googlechatpubsub] Poll loop started");
-        } catch (startErr: any) {
-          logger.error(`[googlechatpubsub] start() CRASHED: ${startErr.stack || startErr.message}`);
+          stopping = false;
+          const run = async () => {
+            await pollOnce();
+            if (!stopping) pollTimer = setTimeout(run, (config.pollIntervalSeconds ?? 3) * 1000);
+          };
+          pollTimer = setTimeout(run, 0);
+          const failed = inbox.snapshot().filter(item => item.state === "failed").length;
+          logger.info(`Pub/Sub listener started (${authMode()}); ${failed} inbox record(s) require operator review`);
+        } catch (error) {
+          stopping = true; await releaseInbox(); releaseInbox = undefined;
+          throw new Error(`Pub/Sub initialization failed: ${safeError(error)}`);
         }
       },
-
-      stop: () => {
-        if (pollTimer) {
-          clearInterval(pollTimer);
-          pollTimer = null;
-        }
-        logger.info("[googlechatpubsub] Stopped");
+      stop: async () => {
+        stopping = true;
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        activeAbort?.abort();
+        // Keep ownership until every active request and agent has settled.
+        while (pollRunning) await new Promise(resolve => setTimeout(resolve, 50));
+        await workerPromise;
+        await releaseInbox?.(); releaseInbox = undefined;
+        logger.info("Pub/Sub listener stopped");
       },
     });
 }

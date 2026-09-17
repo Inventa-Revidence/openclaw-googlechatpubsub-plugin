@@ -297,7 +297,7 @@ test("uploadAttachment — size guards", async (t) => {
               token: "t",
             }),
           (err) => {
-            assert.match(err.message, /File huge\.zip is 200\.0 MB, over the Google Chat 200 MB limit/);
+            assert.match(err.message, /configured byte limit/);
             return true;
           }
         );
@@ -306,11 +306,11 @@ test("uploadAttachment — size guards", async (t) => {
     );
   });
 
-  await t.test("reports the size in MB for a clearly oversized file", async () => {
+  await t.test("rejects a clearly oversized file", async () => {
     const oversized = { length: 250 * 1024 * 1024 };
     await assert.rejects(
       () => uploadAttachment({ space: SPACE, media: media({ buffer: oversized, filename: "x.bin" }), token: "t" }),
-      /is 250\.0 MB, over the Google Chat 200 MB limit/
+      /configured byte limit/
     );
   });
 
@@ -329,7 +329,7 @@ test("uploadAttachment — size guards", async (t) => {
 });
 
 test("uploadAttachment — error responses", async (t) => {
-  await t.test("throws with status and body on a non-200", async () => {
+  await t.test("throws with status and redacts the response body", async () => {
     await withChat(
       () => ({ status: 403, body: { error: { message: "ACCESS_TOKEN_SCOPE_INSUFFICIENT" } } }),
       async () => {
@@ -337,7 +337,7 @@ test("uploadAttachment — error responses", async (t) => {
           () => uploadAttachment({ space: SPACE, media: media(), token: "t" }),
           (err) => {
             assert.match(err.message, /Attachment upload failed \(403\)/);
-            assert.match(err.message, /ACCESS_TOKEN_SCOPE_INSUFFICIENT/);
+            assert.doesNotMatch(err.message, /ACCESS_TOKEN_SCOPE_INSUFFICIENT/);
             return true;
           }
         );
@@ -345,7 +345,7 @@ test("uploadAttachment — error responses", async (t) => {
     );
   });
 
-  await t.test("truncates a long error body to 300 characters", async () => {
+  await t.test("redacts a long error body", async () => {
     const long = "E".repeat(5000);
     await withChat(
       () => ({ status: 500, body: long, headers: { "Content-Type": "text/plain" } }),
@@ -354,7 +354,7 @@ test("uploadAttachment — error responses", async (t) => {
           () => uploadAttachment({ space: SPACE, media: media(), token: "t" }),
           (err) => {
             const detail = err.message.split("): ")[1];
-            assert.equal(detail.length, 300, "error detail should be capped at 300 chars");
+            assert.equal(detail, "request rejected");
             return true;
           }
         );
@@ -370,7 +370,7 @@ test("uploadAttachment — error responses", async (t) => {
           () => uploadAttachment({ space: SPACE, media: media(), token: "t" }),
           (err) => {
             assert.match(err.message, /Attachment upload returned non-JSON/);
-            assert.match(err.message, /proxy interstitial/);
+            assert.doesNotMatch(err.message, /proxy interstitial/);
             return true;
           }
         );

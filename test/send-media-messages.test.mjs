@@ -362,7 +362,7 @@ test("sendMediaMessages — failure isolation", async (t) => {
     });
   });
 
-  await t.test("failure entries name the ref and the reason", async () => {
+  await t.test("failure entries redact paths and server responses", async () => {
     await withChat(chatHandler({ failUploadsFor: ["bad"] }), async () => {
       const result = await sendMediaMessages({
         space: SPACE,
@@ -371,8 +371,8 @@ test("sendMediaMessages — failure isolation", async (t) => {
         readFile: memReader({ "bad.png": PNG_1X1 }),
       });
       assert.equal(result.failed.length, 1);
-      assert.match(result.failed[0], /^\/tmp\/bad\.png: /);
-      assert.match(result.failed[0], /Attachment upload failed \(500\)/);
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
     });
   });
 
@@ -386,7 +386,7 @@ test("sendMediaMessages — failure isolation", async (t) => {
       });
       assert.equal(result.sent, 1);
       assert.equal(result.failed.length, 1);
-      assert.match(result.failed[0], /missing\.png: ENOENT/);
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
       assert.equal(chat.requests.filter(isUpload).length, 1, "only the resolvable ref is uploaded");
     });
   });
@@ -400,7 +400,7 @@ test("sendMediaMessages — failure isolation", async (t) => {
         readFile: memReader({ "a.png": PNG_1X1 }),
       });
       assert.equal(result.sent, 1);
-      assert.match(result.failed[0], /Empty media reference/);
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
     });
   });
 
@@ -413,7 +413,7 @@ test("sendMediaMessages — failure isolation", async (t) => {
         readFile: memReader({ "empty.png": Buffer.alloc(0), "a.png": PNG_1X1 }),
       });
       assert.equal(result.sent, 1);
-      assert.match(result.failed[0], /Refusing to upload empty file/);
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
     });
   });
 
@@ -427,12 +427,12 @@ test("sendMediaMessages — failure isolation", async (t) => {
       });
       assert.equal(result.sent, 0);
       assert.equal(result.failed.length, 1);
-      assert.match(result.failed[0], /Message create failed \(500\)/);
+      assert.equal(result.failed[0], "Attachment delivery failed: Error");
       assert.equal(chat.requests.filter(isUpload).length, 1, "the upload did happen");
     });
   });
 
-  await t.test("a 2xx message response with no name still counts as sent", async () => {
+  await t.test("a 2xx response without identity is an uncertain failed delivery", async () => {
     await withChat(
       (req) => {
         if (isUpload(req)) {
@@ -447,7 +447,8 @@ test("sendMediaMessages — failure isolation", async (t) => {
           token: "oauth",
           readFile: memReader({ "a.png": PNG_1X1 }),
         });
-        assert.equal(result.sent, 1);
+        assert.equal(result.sent, 0);
+        assert.equal(result.failed.length, 1);
         assert.deepEqual(result.messageIds, [], "no id to collect");
       }
     );
@@ -543,7 +544,7 @@ test("sendMediaMessages — caption survives total failure", async (t) => {
         });
         assert.equal(result.sent, 0);
         assert.equal(result.failed.length, 1);
-        assert.match(result.failed[0], /Message create failed \(500\)/);
+        assert.equal(result.failed[0], "Attachment delivery failed: Error");
 
         const delivered = chat.requests.filter(isMessage);
         assert.equal(delivered.length, 2, "failed attachment post plus plain-text fallback");

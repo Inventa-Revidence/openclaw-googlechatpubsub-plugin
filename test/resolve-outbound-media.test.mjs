@@ -79,7 +79,7 @@ test("resolveOutboundMedia — local filesystem paths", async (t) => {
   await t.test("propagates a read error for a missing file", async () => {
     await assert.rejects(
       () => resolveOutboundMedia(path.join(tmp.dir, "does-not-exist.png")),
-      /ENOENT/
+      /file not found/
     );
   });
 });
@@ -323,7 +323,7 @@ test("resolveOutboundMedia — http(s) references", async (t) => {
     );
   });
 
-  await t.test("throws on a non-200 response and names the status and URL", async () => {
+  await t.test("throws on a non-200 response without leaking the URL", async () => {
     await withHost(
       () => ({ status: 404, body: "nope" }),
       async (host) => {
@@ -332,7 +332,7 @@ test("resolveOutboundMedia — http(s) references", async (t) => {
           () => resolveOutboundMedia(url),
           (err) => {
             assert.match(err.message, /Fetch media failed \(404\)/);
-            assert.ok(err.message.includes(url), "error should name the URL");
+            assert.ok(!err.message.includes(url), "error must redact the URL");
             return true;
           }
         );

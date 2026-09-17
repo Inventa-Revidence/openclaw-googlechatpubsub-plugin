@@ -2,10 +2,12 @@
   "id": "googlechatpubsub",
   "kind": "channel",
   "name": "Google Chat Pub/Sub Listener",
-  "description": "Listen to Google Chat spaces via Workspace Events + Pub/Sub — no @mention required. Multi-agent routing with keyword and alwaysListen support.",
+  "description": "Listen to Google Chat spaces via Workspace Events + Pub/Sub \u2014 no @mention required. Multi-agent routing with keyword and alwaysListen support.",
   "version": "0.8.0",
   "entry": "dist/index.js",
-  "channels": ["googlechatpubsub"],
+  "channels": [
+    "googlechatpubsub"
+  ],
   "channelConfigs": {
     "googlechatpubsub": {
       "label": "Google Chat (Pub/Sub)",
@@ -14,26 +16,76 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "projectId": { "type": "string", "description": "GCP project ID" },
-          "topicId": { "type": "string", "description": "Pub/Sub topic ID" },
-          "subscriptionId": { "type": "string", "description": "Pub/Sub subscription ID" },
-          "pollIntervalSeconds": { "type": "number", "minimum": 1, "default": 3 },
-          "renewalBufferMinutes": { "type": "number", "minimum": 5, "default": 30 },
-          "agentTimeoutSeconds": { "type": "number", "minimum": 10, "default": 60 },
-          "serviceAccountFile": { "type": "string", "description": "Path to Google Chat bot service account JSON (falls back to channels.googlechat.serviceAccountFile)" },
-          "crossAgentDispatch": { "type": "boolean", "default": false, "description": "When true, agent replies mentioning other agents' keywords trigger automatic cross-dispatch to those agents." },
-          "silentReply": { "type": "boolean", "default": false, "description": "When true, suppress typing indicator messages while the agent is working." },
+          "enabled": {
+            "type": "boolean"
+          },
+          "projectId": {
+            "type": "string",
+            "description": "GCP project ID"
+          },
+          "topicId": {
+            "type": "string",
+            "description": "Pub/Sub topic ID"
+          },
+          "subscriptionId": {
+            "type": "string",
+            "description": "Pub/Sub subscription ID"
+          },
+          "pollIntervalSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 3,
+            "maximum": 300
+          },
+          "renewalBufferMinutes": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 30,
+            "maximum": 60
+          },
+          "agentTimeoutSeconds": {
+            "type": "integer",
+            "minimum": 10,
+            "default": 60,
+            "maximum": 3600,
+            "description": "Request cancellation on timeout and wait for the run to settle before starting another."
+          },
+          "serviceAccountFile": {
+            "type": "string",
+            "description": "Path to Google Chat bot service account JSON (falls back to channels.googlechat.serviceAccountFile)"
+          },
+          "crossAgentDispatch": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, agent replies mentioning other agents' keywords trigger automatic cross-dispatch to those agents."
+          },
+          "silentReply": {
+            "type": "boolean",
+            "default": true,
+            "description": "When true, suppress typing indicator messages while the agent is working."
+          },
           "oauth": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "clientId": { "type": "string" },
-              "clientSecret": { "type": "string" },
-              "redirectUri": { "type": "string" },
-              "tokensFile": { "type": "string" }
+              "clientId": {
+                "type": "string"
+              },
+              "clientSecret": {
+                "type": "string"
+              },
+              "redirectUri": {
+                "type": "string"
+              },
+              "tokensFile": {
+                "type": "string"
+              }
             },
-            "required": ["clientId", "clientSecret", "tokensFile"]
+            "required": [
+              "clientId",
+              "clientSecret",
+              "tokensFile"
+            ]
           },
           "bindings": {
             "type": "array",
@@ -41,35 +93,215 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "space": { "type": "string", "description": "Google Chat space name (e.g. spaces/ABC123example)" },
-                "replyInThread": { "type": "boolean", "default": false, "description": "When true, replies are always posted in a thread." },
-                "threadSessionIsolation": { "type": "boolean", "description": "When true, each thread gets its own session. Defaults to replyInThread." },
+                "space": {
+                  "type": "string",
+                  "description": "Google Chat space name (e.g. spaces/ABC123example)",
+                  "pattern": "^spaces/[A-Za-z0-9_-]+$"
+                },
+                "replyInThread": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "When true, replies are always posted in a thread."
+                },
+                "threadSessionIsolation": {
+                  "type": "boolean",
+                  "description": "When true, each thread gets its own session. Defaults to replyInThread."
+                },
                 "agents": {
                   "type": "array",
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                      "agentId": { "type": "string" },
-                      "mentionKeyword": { "type": "string" },
-                      "alwaysListen": { "type": "boolean", "default": false }
+                      "agentId": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9_-]{1,80}$"
+                      },
+                      "mentionKeyword": {
+                        "type": "string"
+                      },
+                      "alwaysListen": {
+                        "type": "boolean",
+                        "default": false
+                      }
                     },
-                    "required": ["agentId"]
-                  }
+                    "required": [
+                      "agentId"
+                    ]
+                  },
+                  "minItems": 1,
+                  "maxItems": 10
+                },
+                "allowFrom": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^users/[0-9]+$"
+                  },
+                  "uniqueItems": true,
+                  "maxItems": 1000,
+                  "description": "Allowed human sender IDs. A space override replaces the global list."
+                },
+                "allowAllSpaceMembers": {
+                  "type": "boolean",
+                  "default": false,
+                  "description": "Explicitly admit all human members of a bound space."
+                },
+                "commandAllowFrom": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^users/[0-9]+$"
+                  },
+                  "uniqueItems": true,
+                  "maxItems": 1000,
+                  "description": "Admitted users allowed to invoke commands; empty by default. Host policy still applies."
                 }
               },
-              "required": ["space", "agents"]
+              "required": [
+                "space",
+                "agents"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 100
+          },
+          "allowFrom": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^users/[0-9]+$"
+            },
+            "uniqueItems": true,
+            "maxItems": 1000,
+            "description": "Allowed human sender IDs. A space override replaces the global list."
+          },
+          "allowAllSpaceMembers": {
+            "type": "boolean",
+            "default": false,
+            "description": "Explicitly admit all human members of a bound space."
+          },
+          "commandAllowFrom": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^users/[0-9]+$"
+            },
+            "uniqueItems": true,
+            "maxItems": 1000,
+            "description": "Admitted users allowed to invoke commands; empty by default. Host policy still applies."
+          },
+          "auth": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "service-account",
+                  "user-oauth"
+                ],
+                "description": "Defaults to user-oauth if oauth is configured; otherwise service-account."
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "reactionsEnabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Enable reaction actions (requires user-oauth)."
+          },
+          "maxPendingMessages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 200,
+            "description": "Includes failed records awaiting review; a full inbox prevents ACK."
+          },
+          "media": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "inboundEnabled": {
+                "type": "boolean",
+                "default": false
+              },
+              "outboundEnabled": {
+                "type": "boolean",
+                "default": false,
+                "description": "Requires user-oauth."
+              },
+              "allowRemoteUrls": {
+                "type": "boolean",
+                "default": false,
+                "description": "Allow public HTTPS media URLs with DNS/redirect checks."
+              },
+              "localRoots": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Absolute allowed roots when the host does not supply an authorized media reader. Symlinks and hardlinks are rejected."
+              },
+              "maxBytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 209715200,
+                "default": 20971520
+              },
+              "maxAttachments": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 5
+              },
+              "retentionHours": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 168,
+                "default": 24
+              }
             }
           }
         },
         "required": []
       },
       "uiHints": {
-        "enabled": { "label": "Enable Pub/Sub Listener" },
-        "projectId": { "label": "GCP Project ID", "placeholder": "my-gcp-project" },
-        "oauth.clientId": { "label": "OAuth Client ID" },
-        "oauth.clientSecret": { "label": "OAuth Client Secret", "sensitive": true },
-        "oauth.tokensFile": { "label": "OAuth Tokens File Path" }
+        "enabled": {
+          "label": "Enable Pub/Sub Listener"
+        },
+        "projectId": {
+          "label": "GCP Project ID",
+          "placeholder": "my-gcp-project"
+        },
+        "oauth.clientId": {
+          "label": "OAuth Client ID"
+        },
+        "oauth.clientSecret": {
+          "label": "OAuth Client Secret",
+          "sensitive": true
+        },
+        "oauth.tokensFile": {
+          "label": "OAuth Tokens File Path"
+        },
+        "auth.mode": {
+          "label": "Authentication mode"
+        },
+        "allowFrom": {
+          "label": "Allowed user IDs"
+        },
+        "commandAllowFrom": {
+          "label": "Command user IDs"
+        },
+        "serviceAccountFile": {
+          "label": "Service account key file"
+        },
+        "media.outboundEnabled": {
+          "label": "Allow uploads (user OAuth only)"
+        }
       }
     }
   },
@@ -77,26 +309,76 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "enabled": { "type": "boolean" },
-      "projectId": { "type": "string", "description": "GCP project ID" },
-      "topicId": { "type": "string", "description": "Pub/Sub topic ID" },
-      "subscriptionId": { "type": "string", "description": "Pub/Sub subscription ID" },
-      "pollIntervalSeconds": { "type": "number", "minimum": 1, "default": 3 },
-      "renewalBufferMinutes": { "type": "number", "minimum": 5, "default": 30 },
-      "agentTimeoutSeconds": { "type": "number", "minimum": 10, "default": 60 },
-      "serviceAccountFile": { "type": "string", "description": "Path to Google Chat bot service account JSON (falls back to channels.googlechat.serviceAccountFile)" },
-      "crossAgentDispatch": { "type": "boolean", "default": false, "description": "When true, agent replies mentioning other agents' keywords trigger automatic cross-dispatch to those agents." },
-      "silentReply": { "type": "boolean", "default": false, "description": "When true, suppress typing indicator messages while the agent is working." },
+      "enabled": {
+        "type": "boolean"
+      },
+      "projectId": {
+        "type": "string",
+        "description": "GCP project ID"
+      },
+      "topicId": {
+        "type": "string",
+        "description": "Pub/Sub topic ID"
+      },
+      "subscriptionId": {
+        "type": "string",
+        "description": "Pub/Sub subscription ID"
+      },
+      "pollIntervalSeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 3,
+        "maximum": 300
+      },
+      "renewalBufferMinutes": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 30,
+        "maximum": 60
+      },
+      "agentTimeoutSeconds": {
+        "type": "integer",
+        "minimum": 10,
+        "default": 60,
+        "maximum": 3600,
+        "description": "Request cancellation on timeout and wait for the run to settle before starting another."
+      },
+      "serviceAccountFile": {
+        "type": "string",
+        "description": "Path to Google Chat bot service account JSON (falls back to channels.googlechat.serviceAccountFile)"
+      },
+      "crossAgentDispatch": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, agent replies mentioning other agents' keywords trigger automatic cross-dispatch to those agents."
+      },
+      "silentReply": {
+        "type": "boolean",
+        "default": true,
+        "description": "When true, suppress typing indicator messages while the agent is working."
+      },
       "oauth": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "clientId": { "type": "string" },
-          "clientSecret": { "type": "string" },
-          "redirectUri": { "type": "string" },
-          "tokensFile": { "type": "string" }
+          "clientId": {
+            "type": "string"
+          },
+          "clientSecret": {
+            "type": "string"
+          },
+          "redirectUri": {
+            "type": "string"
+          },
+          "tokensFile": {
+            "type": "string"
+          }
         },
-        "required": ["clientId", "clientSecret", "tokensFile"]
+        "required": [
+          "clientId",
+          "clientSecret",
+          "tokensFile"
+        ]
       },
       "bindings": {
         "type": "array",
@@ -104,34 +386,214 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "space": { "type": "string", "description": "Google Chat space name (e.g. spaces/TESTSPACE123)" },
-            "replyInThread": { "type": "boolean", "default": false, "description": "When true, bot always replies in a thread (never main window). Messages in main window get a new thread." },
-            "threadSessionIsolation": { "type": "boolean", "description": "When true, each thread gets its own session (Telegram forum style). Defaults to value of replyInThread." },
+            "space": {
+              "type": "string",
+              "description": "Google Chat space name (e.g. spaces/ABC123example)",
+              "pattern": "^spaces/[A-Za-z0-9_-]+$"
+            },
+            "replyInThread": {
+              "type": "boolean",
+              "default": false,
+              "description": "When true, replies are always posted in a thread."
+            },
+            "threadSessionIsolation": {
+              "type": "boolean",
+              "description": "When true, each thread gets its own session. Defaults to replyInThread."
+            },
             "agents": {
               "type": "array",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                  "agentId": { "type": "string" },
-                  "mentionKeyword": { "type": "string" },
-                  "alwaysListen": { "type": "boolean", "default": false }
+                  "agentId": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,80}$"
+                  },
+                  "mentionKeyword": {
+                    "type": "string"
+                  },
+                  "alwaysListen": {
+                    "type": "boolean",
+                    "default": false
+                  }
                 },
-                "required": ["agentId"]
-              }
+                "required": [
+                  "agentId"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 10
+            },
+            "allowFrom": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^users/[0-9]+$"
+              },
+              "uniqueItems": true,
+              "maxItems": 1000,
+              "description": "Allowed human sender IDs. A space override replaces the global list."
+            },
+            "allowAllSpaceMembers": {
+              "type": "boolean",
+              "default": false,
+              "description": "Explicitly admit all human members of a bound space."
+            },
+            "commandAllowFrom": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^users/[0-9]+$"
+              },
+              "uniqueItems": true,
+              "maxItems": 1000,
+              "description": "Admitted users allowed to invoke commands; empty by default. Host policy still applies."
             }
           },
-          "required": ["space", "agents"]
+          "required": [
+            "space",
+            "agents"
+          ]
+        },
+        "minItems": 1,
+        "maxItems": 100
+      },
+      "allowFrom": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^users/[0-9]+$"
+        },
+        "uniqueItems": true,
+        "maxItems": 1000,
+        "description": "Allowed human sender IDs. A space override replaces the global list."
+      },
+      "allowAllSpaceMembers": {
+        "type": "boolean",
+        "default": false,
+        "description": "Explicitly admit all human members of a bound space."
+      },
+      "commandAllowFrom": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^users/[0-9]+$"
+        },
+        "uniqueItems": true,
+        "maxItems": 1000,
+        "description": "Admitted users allowed to invoke commands; empty by default. Host policy still applies."
+      },
+      "auth": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "service-account",
+              "user-oauth"
+            ],
+            "description": "Defaults to user-oauth if oauth is configured; otherwise service-account."
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      "reactionsEnabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Enable reaction actions (requires user-oauth)."
+      },
+      "maxPendingMessages": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000,
+        "default": 200,
+        "description": "Includes failed records awaiting review; a full inbox prevents ACK."
+      },
+      "media": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "inboundEnabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "outboundEnabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Requires user-oauth."
+          },
+          "allowRemoteUrls": {
+            "type": "boolean",
+            "default": false,
+            "description": "Allow public HTTPS media URLs with DNS/redirect checks."
+          },
+          "localRoots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [],
+            "description": "Absolute allowed roots when the host does not supply an authorized media reader. Symlinks and hardlinks are rejected."
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 209715200,
+            "default": 20971520
+          },
+          "maxAttachments": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10,
+            "default": 5
+          },
+          "retentionHours": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 168,
+            "default": 24
+          }
         }
       }
     },
     "required": []
   },
   "uiHints": {
-    "enabled": { "label": "Enable Pub/Sub Listener" },
-    "projectId": { "label": "GCP Project ID", "placeholder": "my-gcp-project" },
-    "oauth.clientId": { "label": "OAuth Client ID" },
-    "oauth.clientSecret": { "label": "OAuth Client Secret", "sensitive": true },
-    "oauth.tokensFile": { "label": "OAuth Tokens File Path" }
+    "enabled": {
+      "label": "Enable Pub/Sub Listener"
+    },
+    "projectId": {
+      "label": "GCP Project ID",
+      "placeholder": "my-gcp-project"
+    },
+    "oauth.clientId": {
+      "label": "OAuth Client ID"
+    },
+    "oauth.clientSecret": {
+      "label": "OAuth Client Secret",
+      "sensitive": true
+    },
+    "oauth.tokensFile": {
+      "label": "OAuth Tokens File Path"
+    },
+    "auth.mode": {
+      "label": "Authentication mode"
+    },
+    "allowFrom": {
+      "label": "Allowed user IDs"
+    },
+    "commandAllowFrom": {
+      "label": "Command user IDs"
+    },
+    "serviceAccountFile": {
+      "label": "Service account key file"
+    },
+    "media.outboundEnabled": {
+      "label": "Allow uploads (user OAuth only)"
+    }
   }
 }
