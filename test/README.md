@@ -1,27 +1,11 @@
-# Tests — outbound media upload
+# Regression tests
 
-## How this works, and why
+Run `npm ci --ignore-scripts`, `npm run typecheck`, `npm test` and `npm run test:pack`. The test script rebuilds first. `npm run test:coverage` produces Node's whole-bundle coverage report. Tests require permission to bind ephemeral localhost ports; no Google access or real credentials are needed.
 
-The functions under test — `guessMimeType`, `resolveOutboundMedia`, `uploadAttachment` and `sendMediaMessages` — are module-internal to `index.ts` and are deliberately not exported: nothing outside the plugin should call them. Rather than widen the public surface purely for testing, `test/helpers/harness.mjs` reads the **built** bundle (`dist/index.js`), applies three surgical string rewrites, writes the result to `.test-tmp/bundle-under-test.mjs`, and imports that. The rewrites are: strip the `openclaw/*` SDK imports (the SDK isn't resolvable in a bare test process), replace the hardcoded `https://chat.googleapis.com` host with a `${globalThis.__GCHAT_BASE__}` interpolation so each test file can point the code at its own local `node:http` mock, and stub the `logger` global that plugin registration would normally assign. A trailing `export { ... }` line then exposes the internals. The harness rebuilds `dist/index.js` automatically when `index.ts` is newer, so tests always measure current source, and it asserts after every rewrite that the edit actually landed — including an explicit check that `node:fs` / `node:path` / `node:crypto` imports survived, because an earlier over-greedy multiline import regex ate them and produced a confusing `extname is not defined`.
+The harness loads the built `dist/index.js` into a temporary module and exports otherwise-private functions for tests. It substitutes the Google Chat/Pub/Sub URL origins, stubs two route/envelope helpers, and supplies a logger/configuration. It **retains real OpenClaw filesystem, SSRF and locking helpers** and the real GoogleAuth client construction. Routing context is captured at the dispatcher boundary; these are not full gateway/LLM integration tests.
 
-## Running
+Older binary/multipart tests register local file-server fixtures. Only those explicit fixture origins bypass the SSRF guard to exercise content formatting over local HTTP. Security tests do not register those hosts: they exercise the actual guard with injected DNS/transport responses, including private addresses, rebinding, cross-origin credential stripping, pinned dispatchers, and redirects. No guard bypass exists in production code.
 
-```bash
-npm test              # all tests
-npm run test:coverage # + Node's built-in whole-file coverage report
-node test/tools/coverage-report.mjs   # per-function coverage of the code under test
-```
+The suite covers sender/command admission, destination restrictions, media defaults, filesystem escapes, bounded streaming, token-client scope separation and refresh coalescing, durable admission before ACK, cross-process restart/locking, deduplication, storage failure, uncertain agent outcomes, nonoverlapping polling, cooperative timeout settlement, log redaction, and Google subscription lifecycle operations. Existing binary-integrity/upload/caption/self-echo regressions remain; expectations that formerly required sensitive error details now require redaction.
 
-`node --test <dir>` is broken on Node v22.23.2 (it resolves the directory as a module and fails with `MODULE_NOT_FOUND`), so the scripts use the glob form `'test/**/*.test.mjs'`. Keep the quotes — the glob must reach Node, not the shell.
-
-Node's own coverage reporter only prints whole-file percentages, and the upload code is ~195 lines of a ~1450-line bundle, so `npm run test:coverage` understates it badly (~17%, dominated by untested Pub/Sub and inbound code). `test/tools/coverage-report.mjs` re-slices the same lcov data by function line range and is the number to look at.
-
-## Conventions
-
-- **Mocks listen on port 0.** `node --test` runs files in parallel processes; a fixed port would make the suite order-dependent. Each mock records the raw request `Buffer`.
-- **Never round-trip a body through a string.** `parseMultipart` scans for boundaries on the `Buffer` directly. Decoding to UTF-8 silently corrupts binary payloads, which would hide exactly the class of bug the binary-integrity assertions exist to catch. Assert with `Buffer.compare(...) === 0`.
-- **No real network.** Everything hits localhost; nothing reaches `googleapis.com`.
-- Files matching `*.test.mjs` are collected; helpers live in `helpers/` and tooling in `tools/` so they aren't picked up as tests.
-
-The suite also verifies that a caption falls back to a plain-text message when
-the file upload succeeds but the attachment message itself fails.
+`test:pack` checks the tarball's exact file allowlist and runtime bytes and loads its real module with OpenClaw 2026.8.2 to register a disabled service. Live Google consent/admin approval, real token refresh, event delivery, expiry/renewal and a running gateway remain staging checks. A passing mocked suite is not proof of production compatibility.

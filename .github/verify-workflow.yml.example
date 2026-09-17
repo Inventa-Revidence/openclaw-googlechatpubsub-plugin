@@ -1,0 +1,22 @@
+name: Verify plugin
+on:
+  pull_request:
+  push:
+    branches: [main, 'fix/**']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: git diff --exit-code -- dist/index.js
+      - run: npm run test:pack
