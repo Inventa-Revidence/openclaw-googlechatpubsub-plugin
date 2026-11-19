@@ -1,5 +1,7 @@
+/// <reference path="./openclaw-file-lock.d.ts" />
+
 import { readFileSync, existsSync, lstatSync } from "node:fs";
-import { acquireFileLock } from "openclaw/plugin-sdk/infra-runtime";
+import { acquireFileLock } from "openclaw/plugin-sdk/file-lock";
 import { atomicJson } from "./safety.js";
 
 export interface InboxRecord<T> {
