@@ -164,7 +164,7 @@ var ServiceAccountTokens = class {
 
 // src/inbox.ts
 import { readFileSync, existsSync, lstatSync as lstatSync2 } from "node:fs";
-import { acquireFileLock } from "openclaw/plugin-sdk/infra-runtime";
+import { acquireFileLock } from "openclaw/plugin-sdk/file-lock";
 var DurableInbox = class {
   constructor(path, maxPending = 200, maxHistory = 2e3) {
     this.path = path;
